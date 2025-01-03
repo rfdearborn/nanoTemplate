@@ -1,4 +1,5 @@
 .DS_Store
+.deepeval_telemtry.txt
 .idea
 .ipynb_checkpoints/
 .vscode

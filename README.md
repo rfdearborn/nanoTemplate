@@ -9,7 +9,7 @@ Just create a venv and install dependencies...
 ```sh
 python -m venv venv
 source venv/bin/activate
-pip install datasets numpy tiktoken torch tqdm transformers wandb 
+pip install datasets deepeval numpy tiktoken torch tqdm transformers wandb 
 ```
 
 ...then download and tokenize [OpenWebText](https://openwebtext2.readthedocs.io/en/latest/):
@@ -23,6 +23,7 @@ You're ready to tinker with GPT2-class models!
 Dependencies:
 
 - `datasets` for huggingface datasets <3 (if you want to download + preprocess OpenWebText)
+- `deepeval` for benchmarks <3
 - `numpy` <3
 - `pytorch` <3
 - `tiktoken` for OpenAI's fast BPE code <3

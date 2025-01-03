@@ -22,6 +22,7 @@ import os
 import time
 
 import numpy as np
+import tiktoken
 import torch
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -38,10 +39,12 @@ eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
-# wandb logging
+# logging
 wandb_log = True
 wandb_project = 'owt'
 wandb_run_name = 'gpt2-124M' # 'run' + str(time.time())
+# benchmarks
+multiple_choice_benchmarks = ['MMLU'] # DeepEval benchmark classes to run
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -233,6 +236,98 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+# benchmarks
+if multiple_choice_benchmarks:
+    import deepeval.benchmarks
+    from deepeval.models.base_model import DeepEvalBaseLLM
+
+    class DeepEvalMCBenchmarkWrapper(DeepEvalBaseLLM):
+        def __init__(self, model):
+            self.model = model
+            self.tokenizer = tiktoken.get_encoding("gpt2")
+
+        # Required by DeepEval
+        def load_model(self):
+            return self.model
+
+        def _setup_model(self):
+            model = self.load_model()
+            model.eval()
+            return model
+
+        def _cleanup_model(self, model):
+            model.train()
+
+        def _clean_and_tokenize(self, prompt):
+            # Remove confusing confinement instructions
+            prompt = prompt.replace("\n\nOutput 'A', 'B', 'C', or 'D'. Full answer not needed.", "")
+            
+            # Tokenize and clip to block size
+            prompt_ids = self.tokenizer.encode(prompt)
+            prompt_ids = prompt_ids[-block_size:]
+            return prompt_ids
+
+        def _generate_single(self, prompt_ids):
+            model = self._setup_model()
+            output_ids = model.generate(prompt_ids, max_new_tokens=1, temperature=0.1)
+            self._cleanup_model(model)
+            return output_ids
+
+        # Required by DeepEval
+        def generate(self, prompt):
+            prompt_ids = self._clean_and_tokenize(prompt)
+            prompt_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+            
+            with ctx, torch.no_grad():
+                output_ids = self._generate_single(prompt_ids)
+            new_output_ids = output_ids.tolist()[0][len(prompt_ids.tolist()[0]):]
+            output = self.tokenizer.decode(new_output_ids)
+            
+            return output
+
+        # Required by DeepEval
+        async def a_generate(self, prompt):
+            return self.generate(prompt)
+
+        def batch_generate(self, prompts):
+            prompt_ids = [self._clean_and_tokenize(p) for p in prompts]
+            max_len = max(max(len(ids) for ids in prompt_ids), 1) # deepeval checks with empty prompt
+            SPACE_TOKEN = 202 # pad with prepended spaces
+            prompt_ids = [
+                [SPACE_TOKEN] * (max_len - len(ids)) + ids 
+                for ids in prompt_ids
+            ]
+            prompt_ids = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+            
+            with ctx, torch.no_grad():
+                output_ids = self._generate_single(prompt_ids)
+            new_output_ids = [
+                ids[len(input_ids):] for ids, input_ids in zip(output_ids.tolist(), prompt_ids.tolist())
+            ]
+            outputs = [self.tokenizer.decode(ids) for ids in new_output_ids]
+
+            return outputs
+
+        def get_model_name(self):
+            return "nanoGPT"
+
+    def get_benchmark_class(benchmark_name):
+        try:
+            return getattr(deepeval.benchmarks, benchmark_name)
+        except AttributeError:
+            raise ImportError(f"Benchmark class '{benchmark_name}' not found in `deepeval.benchmarks`.")
+
+    def run_deep_eval_benchmark(model, benchmark_name):
+        benchmark_class = get_benchmark_class(benchmark_name)
+        benchmark_model = DeepEvalMCBenchmarkWrapper(model)
+        benchmark_obj = benchmark_class()
+        results = benchmark_obj.evaluate(model=benchmark_model, batch_size=batch_size)
+
+        return {
+            'overall_score': benchmark_obj.overall_score,
+            'task_scores': [(row['Task'], float(row['Score'])) for _, row in benchmark_obj.task_scores.iterrows()],
+        }
+
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
@@ -250,14 +345,22 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        benchmark_scores = {}
+        for benchmark_name in multiple_choice_benchmarks:
+            benchmark_results = run_deep_eval_benchmark(raw_model, benchmark_name)
+            print(f"{benchmark_name} results: {benchmark_results}")
+            benchmark_scores[benchmark_name] = benchmark_results['overall_score']
         if wandb_log:
-            wandb.log({
+            wandb_dict = {
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            })
+            }
+            for benchmark_name, score in benchmark_scores.items():
+                wandb_dict[f"benchmarks/{benchmark_name}"] = score
+            wandb.log(wandb_dict)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:

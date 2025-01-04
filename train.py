@@ -17,10 +17,14 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 """
 
 from contextlib import nullcontext
+from dataclasses import dataclass
 import math
 import os
+import random
 import time
+from typing import List, Optional
 
+from datasets import load_dataset
 import numpy as np
 import tiktoken
 import torch
@@ -28,6 +32,17 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from model import GPT, GPTConfig
+
+@dataclass
+class DatasetConfig:
+    dataset: str
+    subset: Optional[str] = None
+    split: str = "train"
+    text_field: str = "text"
+    sample_weight: float = 1.0
+    initially_skip: Optional[int] = None # can be used for resuming
+    shuffle_buffer_size: int = 1000
+    shuffle_seed: int = 1337
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -46,7 +61,10 @@ wandb_run_name = 'gpt2-124M' # 'run' + str(time.time())
 # benchmarks
 multiple_choice_benchmarks = ['MMLU'] # DeepEval benchmark classes to run
 # data
-dataset = 'openwebtext'
+train_datasets = [
+    DatasetConfig(dataset="openwebtext")
+]
+val_datasets = train_datasets # owt only has train split; should be fine
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -115,23 +133,92 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('data', dataset)
+class StreamingDatasetsManager:
+    def __init__(self, dataset_configs: List[DatasetConfig], tokenizer_name: str = "gpt2"):
+        self.tokenizer = tiktoken.get_encoding(tokenizer_name)
+        self.datasets = []
+        for dc in dataset_configs:
+            self.datasets.append(
+                self._init_dataset(dc)
+            )
+    
+    def _init_dataset(self, config: DatasetConfig):
+        epoch = 0
+        stream = self._get_stream(config, epoch)
+        return {
+            "config": config,
+            "stream": stream,
+            "iterator": iter(stream),
+            "epoch": epoch,
+        }
+
+    def _get_stream(self, config: DatasetConfig, epoch: int):
+        stream = load_dataset(
+            config.dataset,
+            config.subset,
+            split=config.split,
+            streaming=True
+        ).shuffle(buffer_size=config.shuffle_buffer_size, seed=config.shuffle_seed)
+        stream.set_epoch(epoch) # in place
+        if epoch == 0 and config.initially_skip:
+            stream = stream.skip(config.initially_skip)
+        return stream
+
+    def _refresh_stream(self, idx: int):
+        config = self.datasets[idx]["config"]
+        current_epoch = self.datasets[idx]["epoch"]
+        new_epoch = current_epoch + 1
+        stream = self._get_stream(config, new_epoch)
+        self.datasets[idx]["stream"] = stream
+        self.datasets[idx]["iterator"] = iter(stream)
+        self.datasets[idx]["epoch"] = new_epoch
+
+    def get_batch(self, batch_size: int, block_size: int, device: str = "cuda"):
+        # Initialize tensors for the batch
+        x = torch.zeros((batch_size, block_size), dtype=torch.long, device=device)
+        y = torch.zeros((batch_size, block_size), dtype=torch.long, device=device)
+        
+        for b in range(batch_size):
+            # Sample a dataset based on weights
+            sample_weights = [dataset["config"].sample_weight for dataset in self.datasets]
+            dataset_idx = random.choices(range(len(self.datasets)), weights=sample_weights)[0]
+            dataset = self.datasets[dataset_idx]
+            
+            # Get documents until we fill this sequence
+            tokens = []
+            while len(tokens) < block_size + 1:  # +1 because we need both x and y
+                try:
+                    iterator = dataset["iterator"]
+                    doc = next(iterator)
+                    # Tokenize the text using the specified field
+                    text_field = dataset["config"].text_field
+                    new_tokens = self.tokenizer.encode(doc[text_field])
+                    if len(tokens) == 0:
+                        # For first doc, start at random position
+                        start_idx = random.randint(0, len(new_tokens) - 1)
+                        new_tokens = new_tokens[start_idx:]
+                    new_tokens.append(self.tokenizer.eot_token)
+                    tokens.extend(new_tokens)
+                except StopIteration:
+                    # Refresh exhausted stream
+                    self._refresh_stream(dataset_idx)
+            
+            # Trim to exact size needed
+            tokens = tokens[:block_size + 1]
+            
+            # Populate x and y for this sequence
+            x[b] = torch.tensor(tokens[:-1], dtype=torch.long, device=device)
+            y[b] = torch.tensor(tokens[1:], dtype=torch.long, device=device)
+        
+        return x, y
+
+datasets = {
+    "train": StreamingDatasetsManager(train_datasets),
+    "val": StreamingDatasetsManager(val_datasets)
+}
+
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+    return datasets[split].get_batch(batch_size, block_size, device)
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0

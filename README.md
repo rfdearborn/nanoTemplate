@@ -12,12 +12,6 @@ source venv/bin/activate
 pip install datasets deepeval numpy tiktoken torch tqdm transformers wandb 
 ```
 
-...then download and tokenize [OpenWebText](https://openwebtext2.readthedocs.io/en/latest/):
-
-```
-python data/openwebtext/prepare.py
-```
-
 You're ready to tinker with GPT2-class models!
 
 Dependencies:
@@ -33,7 +27,12 @@ Dependencies:
 
 ## configuration
 
-The main model is defined in `model.py`. Parameters and their defaults are defined in `train.py`, and are mostly the same as in the original repo. They can be overriden by files in `config/`.
+The main model is defined in `model.py`. Parameters and their defaults are defined in `train.py`, and are mostly the same as in the original repo but with these notable additions:
+
+- `multiple_choice_benchmarks`: a list of DeepEval benchmark classes to run on each eval interval
+- `train_datasets`, `val_datasets`: lists of `DatasetConfig` objects defining training and eval dataset streams
+
+Parameters can be overriden by files in `config/`.
 
 ## training
 

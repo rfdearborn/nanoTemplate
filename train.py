@@ -74,6 +74,7 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+tokenizer = 'gpt2'
 vocab_size = 50304 # (50257 rounded up for efficiency)
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -134,8 +135,8 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 class StreamingDatasetsManager:
-    def __init__(self, dataset_configs: List[DatasetConfig], tokenizer_name: str = "gpt2"):
-        self.tokenizer = tiktoken.get_encoding(tokenizer_name)
+    def __init__(self, dataset_configs: List[DatasetConfig]):
+        self.tokenizer = tiktoken.get_encoding(tokenizer)
         self.datasets = []
         for dc in dataset_configs:
             self.datasets.append(
@@ -226,7 +227,7 @@ best_val_loss = 1e9
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=vocab_size, dropout=dropout) # start with model_args from command line
+                  bias=bias, tokenizer=tokenizer, vocab_size=vocab_size, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -331,7 +332,7 @@ if multiple_choice_benchmarks:
     class DeepEvalMCBenchmarkWrapper(DeepEvalBaseLLM):
         def __init__(self, model):
             self.model = model
-            self.tokenizer = tiktoken.get_encoding("gpt2")
+            self.tokenizer = tiktoken.get_encoding(tokenizer)
 
         # Required by DeepEval
         def load_model(self):

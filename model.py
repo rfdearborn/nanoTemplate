@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import inspect
 import math
 
+import tiktoken
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -91,6 +92,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024
+    tokenizer: str = "gpt2"
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
@@ -105,6 +107,7 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        self.tokenizer = tiktoken.get_encoding(config.tokenizer)
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -307,6 +310,8 @@ class GPT(nn.Module):
             probs = F.softmax(logits, dim=-1)
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
+            # clamp in case vocab_size is padded up
+            idx_next = idx_next.clamp(max=self.tokenizer.max_token_value)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 

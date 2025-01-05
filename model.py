@@ -132,6 +132,7 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        self.print_parameter_summary()
 
     def get_num_params(self, non_embedding=True):
         """
@@ -144,6 +145,16 @@ class GPT(nn.Module):
         if non_embedding:
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
+
+    def print_parameter_summary(self):
+        """Prints a summary of parameters in the model."""
+        print("\nParameter Summary:")
+        total_params = 0
+        for name, param in self.named_parameters():
+            param_count = param.numel()
+            total_params += param_count
+            print(f"{name:70} {param.shape} \t params: {param_count}")
+        print(f"\nTotal Parameters: {total_params}")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):

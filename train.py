@@ -20,7 +20,6 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 import math
 import os
-import random
 import time
 from typing import List, Optional
 
@@ -181,8 +180,8 @@ class StreamingDatasetsManager:
         
         for b in range(batch_size):
             # Sample a dataset based on weights
-            sample_weights = [dataset["config"].sample_weight for dataset in self.datasets]
-            dataset_idx = random.choices(range(len(self.datasets)), weights=sample_weights)[0]
+            sample_weights = torch.tensor([dataset["config"].sample_weight for dataset in self.datasets], device=device)
+            dataset_idx = torch.multinomial(sample_weights, 1).item()
             dataset = self.datasets[dataset_idx]
             
             # Get documents until we fill this sequence
@@ -196,7 +195,7 @@ class StreamingDatasetsManager:
                     new_tokens = self.tokenizer.encode(doc[text_field])
                     if len(tokens) == 0:
                         # For first doc, start at random position
-                        start_idx = random.randint(0, len(new_tokens) - 1)
+                        start_idx = torch.randint(0, len(new_tokens), (1,)).item()
                         new_tokens = new_tokens[start_idx:]
                     new_tokens.append(self.tokenizer.eot_token)
                     tokens.extend(new_tokens)

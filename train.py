@@ -410,10 +410,14 @@ if multiple_choice_benchmarks:
         benchmark_obj = benchmark_class()
         results = benchmark_obj.evaluate(model=benchmark_model, batch_size=batch_size)
 
-        return {
+        result_dict = {
             'overall_score': benchmark_obj.overall_score,
-            'task_scores': [(row['Task'], float(row['Score'])) for _, row in benchmark_obj.task_scores.iterrows()],
         }
+        if hasattr(benchmark_obj, 'task_scores'):
+            result_dict['task_scores'] = [(row['Task'], float(row['Score'])) 
+                                        for _, row in benchmark_obj.task_scores.iterrows()]
+
+        return result_dict
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch

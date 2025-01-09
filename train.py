@@ -59,7 +59,7 @@ wandb_log = True
 wandb_project = 'owt'
 wandb_run_name = 'gpt2-124M' # 'run' + str(time.time())
 # benchmarks
-multiple_choice_benchmarks = ['MMLU'] # DeepEval benchmark classes to run
+multiple_choice_benchmarks = ['HellaSwag', 'MMLU', 'Winogrande'] # DeepEval benchmark classes to run
 # data
 train_datasets = [
     DatasetConfig(dataset="openwebtext")

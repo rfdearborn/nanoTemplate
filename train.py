@@ -18,6 +18,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from inspect import signature
 import math
 import os
 import time
@@ -408,7 +409,12 @@ if multiple_choice_benchmarks:
         benchmark_class = get_benchmark_class(benchmark_name)
         benchmark_model = DeepEvalMCBenchmarkWrapper(model)
         benchmark_obj = benchmark_class()
-        results = benchmark_obj.evaluate(model=benchmark_model, batch_size=batch_size)
+        
+        eval_params = signature(benchmark_obj.evaluate).parameters
+        if 'batch_size' in eval_params:
+            results = benchmark_obj.evaluate(model=benchmark_model, batch_size=batch_size)
+        else:
+            results = benchmark_obj.evaluate(model=benchmark_model)
 
         result_dict = {
             'overall_score': benchmark_obj.overall_score,

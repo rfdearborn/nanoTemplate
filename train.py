@@ -38,6 +38,7 @@ class DatasetConfig:
     dataset: str
     subset: Optional[str] = None
     split: str = "train"
+    filter_fn: Optional[callable] = None
     text_field: str = "text"
     sample_weight: float = 1.0
     initially_skip: Optional[int] = None # can be used for resuming
@@ -62,9 +63,17 @@ wandb_run_name = 'gpt2-124M' # 'run' + str(time.time())
 multiple_choice_benchmarks = ['HellaSwag', 'MMLU', 'Winogrande'] # DeepEval benchmark classes to run
 # data
 train_datasets = [
-    DatasetConfig(dataset="openwebtext")
+    DatasetConfig(
+        dataset='openwebtext',
+        filter_fn=lambda _, idx: abs(hash(str(idx))) % 100 > 0
+    )
 ]
-val_datasets = train_datasets # owt only has train split; should be fine
+val_datasets = [
+    DatasetConfig(
+        dataset='openwebtext',
+        filter_fn=lambda _, idx: abs(hash(str(idx))) % 100 == 0
+    )
+]
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -161,6 +170,8 @@ class StreamingDatasetsManager:
             streaming=True
         ).shuffle(buffer_size=config.shuffle_buffer_size, seed=config.shuffle_seed)
         stream.set_epoch(epoch) # in place
+        if config.filter_fn:
+            stream = stream.filter(config.filter_fn, with_indices=True)
         if epoch == 0 and config.initially_skip:
             stream = stream.skip(config.initially_skip)
         return stream

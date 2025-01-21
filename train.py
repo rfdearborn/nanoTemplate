@@ -17,15 +17,15 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 """
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from inspect import signature
 import math
 import os
 import time
 from typing import List, Optional
+import unicodedata
 
 from datasets import load_dataset
-import numpy as np
 import tiktoken
 import torch
 from torch.distributed import init_process_group, destroy_process_group
@@ -40,6 +40,7 @@ class DatasetConfig:
     split: str = "train"
     filter_fn: Optional[callable] = None
     text_field: str = "text"
+    doc_id_field: Optional[str] = None
     sample_weight: float = 1.0
     initially_skip: Optional[int] = None # can be used for resuming
     shuffle_buffer_size: int = 1000
@@ -49,31 +50,38 @@ class DatasetConfig:
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 1000
+eval_interval = 100
 log_interval = 10
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = False # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # logging
 wandb_log = True
-wandb_project = 'owt'
+wandb_project = 'nanoRETRO'
 wandb_run_name = 'gpt2-124M' # 'run' + str(time.time())
 # benchmarks
 multiple_choice_benchmarks = ['HellaSwag', 'MMLU', 'Winogrande'] # DeepEval benchmark classes to run
 # data
+# DOLMino 50B mix, ex-math:
+# https://huggingface.co/datasets/allenai/dolmino-mix-1124#mix-compositions
+dolmino_mix = [
+    ('dclm', 47.2),
+    ('flan', 16.6),
+    ('pes2o', 5.85),
+    ('wiki', 7.11),
+    ('stackexchange', 2.45),
+]
 train_datasets = [
     DatasetConfig(
-        dataset='openwebtext',
-        filter_fn=lambda _, idx: abs(hash(str(idx))) % 100 > 0
+        dataset='allenai/dolmino-mix-1124',
+        subset=d[0],
+        doc_id_field="id",
+        sample_weight=d[1],
+        shuffle_buffer_size=100000,
     )
+    for d in dolmino_mix
 ]
-val_datasets = [
-    DatasetConfig(
-        dataset='openwebtext',
-        filter_fn=lambda _, idx: abs(hash(str(idx))) % 100 == 0
-    )
-]
+# we use benchmarks as val; splitting datasets doesn't add anything
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -86,23 +94,36 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 tokenizer = 'gpt2'
 vocab_size = 50304 # (50257 rounded up for efficiency)
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
+learning_rate = 6e-5 # max learning rate
 max_iters = 600000 # total number of training iterations
-weight_decay = 1e-1
+weight_decay = 1e-2
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+warmup_iters = 0 # how many steps to warm up for
+lr_decay_iters = 60000 # should be ~= max_iters per Chinchilla
+min_lr = 6e-6 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+# retrieval settings
+use_retrieval = False  # Whether to enable RETRO mechanism
+retrieval_layers = (5, 8, 11) # Layers at which to apply retrieval (0-indexed)
+retrieval_chunk_size = 64  # Splits of input tokens for which neighbors will be retrieved
+retrieval_embedding_model = 'sentence-transformers/all-mpnet-base-v2' # Embedding model for neighbor search
+retrieval_milvus_host = "localhost" # Milvus host
+retrieval_milvus_port = "19530" # Milvus port
+retrieval_milvus_collection_name = 'omnikb_64_gpt2'  # Milvus collection name
+retrieval_k_neighbors = 2  # Number of neighbors to retrieve
+retrieval_neighbor_size = 128 # Maximum sequence length for neighbor encoder
+retrieval_neighbor_continuations = True # Whether to extend retrieved neighbors with next records
+retrieval_neighbor_encoder_n_layer = 2 # Number of layers in the neighbor encoder
+retrieval_neighbor_encoder_cross_attn_layers = (0, 1) # Layers at which to apply cross-attention in neighbor encoder
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -146,6 +167,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 class StreamingDatasetsManager:
     def __init__(self, dataset_configs: List[DatasetConfig]):
         self.tokenizer = tiktoken.get_encoding(tokenizer)
+        self.encode_kwargs = {"allowed_special": {"<|endoftext|>"}} # eots are in the dataset
         self.datasets = []
         for dc in dataset_configs:
             self.datasets.append(
@@ -185,10 +207,22 @@ class StreamingDatasetsManager:
         self.datasets[idx]["iterator"] = iter(stream)
         self.datasets[idx]["epoch"] = new_epoch
 
+    def _sanitize(self, doc_id: str):
+        # avoid querying with invalid UTF-8 characters
+        if not isinstance(doc_id, str):
+            doc_id = str(doc_id)
+        try:
+            doc_id = doc_id.encode('unicode-escape').decode('ascii')
+        except Exception as e:
+            print(f"Error sanitizing doc_id: {e}")
+            doc_id = "invalid_doc_id"
+        return doc_id
+
     def get_batch(self, batch_size: int, block_size: int, device: str = "cuda"):
         # Initialize tensors for the batch
         x = torch.zeros((batch_size, block_size), dtype=torch.long, device=device)
         y = torch.zeros((batch_size, block_size), dtype=torch.long, device=device)
+        doc_ids = []
         
         for b in range(batch_size):
             # Sample a dataset based on weights
@@ -197,36 +231,44 @@ class StreamingDatasetsManager:
             dataset = self.datasets[dataset_idx]
             
             # Get documents until we fill this sequence
-            tokens = []
-            while len(tokens) < block_size + 1:  # +1 because we need both x and y
+            sequence_tokens = []
+            sequence_doc_ids = []
+            while len(sequence_tokens) < block_size + 1:  # +1 because we need both x and y
                 try:
                     iterator = dataset["iterator"]
                     doc = next(iterator)
+                    config = dataset["config"]
                     # Tokenize the text using the specified field
-                    text_field = dataset["config"].text_field
-                    new_tokens = self.tokenizer.encode(doc[text_field])
-                    if len(tokens) == 0:
+                    text_field = config.text_field
+                    new_tokens = self.tokenizer.encode(doc[text_field], **self.encode_kwargs)
+                    if len(sequence_tokens) == 0:
                         # For first doc, start at random position
                         start_idx = torch.randint(0, len(new_tokens), (1,)).item()
                         new_tokens = new_tokens[start_idx:]
                     new_tokens.append(self.tokenizer.eot_token)
-                    tokens.extend(new_tokens)
+                    sequence_tokens.extend(new_tokens)
+                    # add doc id if specified
+                    if config.doc_id_field:
+                        doc_id = doc[config.doc_id_field]
+                        doc_id = self._sanitize(doc_id)
+                        sequence_doc_ids.append(doc_id)
                 except StopIteration:
                     # Refresh exhausted stream
                     self._refresh_stream(dataset_idx)
             
             # Trim to exact size needed
-            tokens = tokens[:block_size + 1]
+            sequence_tokens = sequence_tokens[:block_size + 1]
             
             # Populate x and y for this sequence
-            x[b] = torch.tensor(tokens[:-1], dtype=torch.long, device=device)
-            y[b] = torch.tensor(tokens[1:], dtype=torch.long, device=device)
+            x[b] = torch.tensor(sequence_tokens[:-1], dtype=torch.long, device=device)
+            y[b] = torch.tensor(sequence_tokens[1:], dtype=torch.long, device=device)
+            doc_ids.append(sequence_doc_ids)
+        batch_id = hash(x)
         
-        return x, y
+        return x, y, doc_ids, batch_id
 
 datasets = {
     "train": StreamingDatasetsManager(train_datasets),
-    "val": StreamingDatasetsManager(val_datasets)
 }
 
 def get_batch(split):
@@ -237,12 +279,32 @@ iter_num = 0
 best_val_loss = 1e9
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, tokenizer=tokenizer, vocab_size=vocab_size, dropout=dropout) # start with model_args from command line
+model_args = dict(
+    n_layer=n_layer,
+    n_head=n_head,
+    n_embd=n_embd,
+    block_size=block_size,
+    bias=bias,
+    tokenizer=tokenizer,
+    vocab_size=vocab_size,
+    dropout=dropout,
+    use_retrieval=use_retrieval,
+    retrieval_layers=retrieval_layers,
+    retrieval_chunk_size=retrieval_chunk_size,
+    retrieval_embedding_model=retrieval_embedding_model,
+    retrieval_milvus_host=retrieval_milvus_host,
+    retrieval_milvus_port=retrieval_milvus_port,
+    retrieval_milvus_collection_name=retrieval_milvus_collection_name,
+    retrieval_k_neighbors=retrieval_k_neighbors,
+    retrieval_neighbor_size=retrieval_neighbor_size,
+    retrieval_neighbor_continuations=retrieval_neighbor_continuations,
+    retrieval_neighbor_encoder_n_layer=retrieval_neighbor_encoder_n_layer,
+    retrieval_neighbor_encoder_cross_attn_layers=retrieval_neighbor_encoder_cross_attn_layers,
+) # start with model_args from command line
+gptconf = GPTConfig(**model_args)
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
-    gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
@@ -250,12 +312,9 @@ elif init_from == 'resume':
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
+    # Update model_args with checkpoint's model_args
+    model_args.update(checkpoint_model_args)
     # create the model
-    gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
@@ -270,7 +329,21 @@ elif init_from == 'resume':
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
+    override_args = dict(
+        dropout=dropout,
+        use_retrieval=use_retrieval,
+        retrieval_layers=retrieval_layers,
+        retrieval_chunk_size=retrieval_chunk_size,
+        retrieval_embedding_model=retrieval_embedding_model,
+        retrieval_milvus_host=retrieval_milvus_host,
+        retrieval_milvus_port=retrieval_milvus_port,
+        retrieval_milvus_collection_name=retrieval_milvus_collection_name,
+        retrieval_k_neighbors=retrieval_k_neighbors,
+        retrieval_neighbor_size=retrieval_neighbor_size,
+        retrieval_neighbor_continuations=retrieval_neighbor_continuations,
+        retrieval_neighbor_encoder_n_layer=retrieval_neighbor_encoder_n_layer,
+        retrieval_neighbor_encoder_cross_attn_layers=retrieval_neighbor_encoder_cross_attn_layers,
+    )
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
@@ -305,12 +378,12 @@ if ddp:
 def estimate_loss():
     out = {}
     model.eval()
-    for split in ['train', 'val']:
+    for split in ['train']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, Y, doc_ids, _ = get_batch(split) # no prefetching during evaluation
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = model(X, Y, doc_ids=doc_ids)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -437,7 +510,9 @@ if multiple_choice_benchmarks:
         return result_dict
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, Y, doc_ids, batch_id = get_batch('train')  # Fetch the very first batch including doc_ids
+if model.retrieval_enabled:  # Start prefetching for first batch
+    model.retriever_manager.prefetch_neighbors(X, doc_ids, batch_id)
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -452,7 +527,7 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {iter_num}: train loss {losses['train']:.4f}")
         benchmark_scores = {}
         for benchmark_name in multiple_choice_benchmarks:
             benchmark_results = run_deep_eval_benchmark(raw_model, benchmark_name)
@@ -462,26 +537,22 @@ while True:
             wandb_dict = {
                 "iter": iter_num,
                 "train/loss": losses['train'],
-                "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             }
             for benchmark_name, score in benchmark_scores.items():
                 wandb_dict[f"benchmarks/{benchmark_name}"] = score
             wandb.log(wandb_dict)
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+        if iter_num > 0:
+            checkpoint = {
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'model_args': model_args,
+                'iter_num': iter_num,
+                'config': config,
+            }
+            print(f"saving checkpoint to {out_dir}")
+            torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
 
@@ -494,13 +565,16 @@ while True:
             # I really dislike that this bloats the code and forces us to repeat code
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+        # async prefetch next batch while model is doing the forward pass on the GPU
+        X_next, Y_next, doc_ids_next, batch_id_next = get_batch('train')
+        if model.retrieval_enabled:
+            model.retriever_manager.prefetch_neighbors(X_next, doc_ids_next, batch_id_next)
         with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+            logits, loss = model(X, Y, doc_ids=doc_ids, prefetched_neighbors_key=batch_id)
+            loss = loss / gradient_accumulation_steps # scale loss for gradient accumulation
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
+        X, Y, doc_ids, batch_id = X_next, Y_next, doc_ids_next, batch_id_next
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)

@@ -1,6 +1,11 @@
-# nanoTemplate
+# nanoRETRO
 
-Reduced [nanoGPT](https://github.com/karpathy/nanoGPT) for fast experimentation with mechanisms and architectures.
+Extension of [nanoGPT](https://github.com/karpathy/nanoGPT) which incorporates RETRO [(Borgeaud et al., 2022)](https://arxiv.org/abs/2112.04426) for fun and science. This matches the paper's final implementation except for the following differences:
+
+- Using Milvus instead of Faiss for the vector database
+- Using all-mpnet-base-v2 instead of bert for chunk and neighbor embeddings
+- Retrieving neighbors on-the-fly instead of pre-computing
+- Using absolute instead of relative position embeddings in the neighbor encoder, and none in cross attention
 
 ## environment setup
 
@@ -9,17 +14,18 @@ Just create a venv and install dependencies...
 ```sh
 python -m venv venv
 source venv/bin/activate
-pip install datasets deepeval numpy tiktoken torch tqdm transformers wandb 
+pip install datasets deepeval pymilvus sentence-transformers tiktoken torch tqdm transformers wandb
 ```
 
-You're ready to tinker with GPT2-class models!
+...then start + populate Milvus. Contact [@rfdearborn](https://github.com/rfdearborn) for canned knowledge base images!
 
 Dependencies:
 
 - `datasets` for huggingface datasets <3 (if you want to download + preprocess OpenWebText)
 - `deepeval` for benchmarks <3
-- `numpy` <3
+- `milvus` for knowledge externalization via their fast+robust vector db <3
 - `pytorch` <3
+- `sentence-transformers` for efficient text embeddings <3
 - `tiktoken` for OpenAI's fast BPE code <3
 - `tqdm` for progress bars <3
 - `transformers` for huggingface transformers <3 (to load GPT-2 checkpoints)
@@ -31,6 +37,7 @@ The main model is defined in `model.py`. Parameters and their defaults are defin
 
 - `multiple_choice_benchmarks`: a list of DeepEval benchmark classes to run on each eval interval
 - `train_datasets`, `val_datasets`: lists of `DatasetConfig` objects defining training and eval dataset streams
+- various RETRO-specific parameters: read the paper for details :)
 
 Parameters can be overriden by files in `config/`.
 

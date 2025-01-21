@@ -7,10 +7,16 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
+import concurrent.futures
+from contextlib import nullcontext
 from dataclasses import dataclass
 import inspect
 import math
+import multiprocessing
+from threading import Lock
 
+from pymilvus import connections, Collection
+from sentence_transformers import SentenceTransformer
 import tiktoken
 import torch
 import torch.nn as nn
@@ -84,9 +90,416 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
+    def forward(self, x, cross_attention_module=None, neighbor_embeddings=None):
         x = x + self.attn(self.ln_1(x))
+        if cross_attention_module is not None:
+            assert neighbor_embeddings is not None
+            x = x + cross_attention_module(x, neighbor_embeddings)
         x = x + self.mlp(self.ln_2(x))
+        return x
+
+# Hardcore pytorch avoidance
+# (There's prob a better way to do this but this works)
+RETRIEVER_CHUNK_ENCODERS = {}
+def get_retriever_chunk_encoder(model_name):
+    global RETRIEVER_CHUNK_ENCODERS
+    if model_name not in RETRIEVER_CHUNK_ENCODERS:
+        RETRIEVER_CHUNK_ENCODERS[model_name] = SentenceTransformer(model_name)
+    return RETRIEVER_CHUNK_ENCODERS[model_name]
+
+PAD_TOKEN_ID = 220 # tokenizer has no pad token; 220 is " "
+
+@torch._dynamo.disable
+class NeighborRetriever(nn.Module):
+
+    def _connect_to_milvus(self, config):
+        connections.connect(
+            alias="default",
+            host=config.retrieval_milvus_host,
+            port=config.retrieval_milvus_port
+        )
+        print(f"Connected to Milvus server at {config.retrieval_milvus_host}:{config.retrieval_milvus_port}")
+
+    def __init__(self, config):
+        super().__init__()
+        self.k_neighbors = config.retrieval_k_neighbors
+        self.neighbor_size = config.retrieval_neighbor_size
+        self.use_continuations = config.retrieval_neighbor_continuations
+        self.chunk_size = config.retrieval_chunk_size
+
+        # Initialize Milvus collection
+        self._connect_to_milvus(config)
+        self.collection = Collection(config.retrieval_milvus_collection_name)
+        self.collection.load()
+
+        # Load the embedding models
+        self.tokenizer = tiktoken.get_encoding(config.tokenizer)
+        self.chunk_encoder = get_retriever_chunk_encoder(config.retrieval_embedding_model)
+        self.embedding_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+
+    def __del__(self):
+        connections.disconnect("default")
+        print("Disconnected from Milvus server")
+
+    def forward(self, idx, doc_ids):
+        """
+        idx: Tensor of shape (B, T)
+        doc_ids: List of lists, length B, each containing unique source doc_ids for that sequence
+        """
+        B, T = idx.size()
+        device = idx.device
+        n_chunks = T // self.chunk_size
+        assert T % self.chunk_size == 0, "Sequence length must be a multiple of chunk size"
+
+        # Reshape idx into chunks
+        idx_chunks = idx.view(B, n_chunks, self.chunk_size)
+
+        # Flatten batch and chunk dimensions for parallel processing
+        B_n_chunks = B * n_chunks
+        idx_chunks_flat = idx_chunks.view(B_n_chunks, self.chunk_size)
+
+        # Decode chunks to text and clip to max seq length
+        idx_chunks_flat_decoded = [
+            self.tokenizer.decode(idx_chunk.tolist())
+            for idx_chunk in idx_chunks_flat
+        ]
+        # Shape: (B_n_chunks)
+
+        # Encode chunks for retrieval using dedicated stream for parallelization
+        with torch.cuda.stream(self.embedding_stream) if self.embedding_stream else nullcontext():
+            query_embeddings_flat = self.chunk_encoder.encode(
+                idx_chunks_flat_decoded,
+                convert_to_tensor=True,
+                batch_size=512 # diminishing returns beyond
+            ).cpu().numpy()
+            # Shape: (B_n_chunks, retrieval_embedding_model_dim)
+
+        if self.embedding_stream:
+            self.embedding_stream.synchronize()
+
+        # Retrieve neighbors
+        excl_doc_ids = set().union(*doc_ids) # We trade a slight chance of false positives for native filtering
+        expr = f"doc_id not in {list(excl_doc_ids)}" if excl_doc_ids else None
+        output_fields = ["id"] if self.use_continuations else ["doc_id", "text"]
+        _results = self.collection.search(
+            data=query_embeddings_flat,
+            anns_field="vector",
+            param={"metric_type": "IP", "params": {"nprobe": 10}},
+            limit=self.k_neighbors,
+            expr=expr,
+            output_fields=output_fields
+        )
+
+        results = []
+        if self.use_continuations:
+            # Get IDs for direct neighbors and their continuations
+            expanded_ids = set()
+            for result in _results:
+                for hit in result:
+                    expanded_ids.add(hit.id)
+                    expanded_ids.add(hit.id + 1)
+            
+            # Batch fetch all 
+            _expanded_results = self.collection.query(
+                expr=f"id in {list(expanded_ids)}",
+                output_fields=["id", "doc_id", "text"]
+            )
+            results_by_id = {str(c["id"]): c for c in _expanded_results}
+            
+            # Reconstruct results with continuations
+            for result in _results:
+                group_results = []
+                for hit in result:
+                    id = hit.id
+                    neighbor = results_by_id.get(str(id))
+                    continuation = results_by_id.get(str(id + 1))
+                    valid_continuation = continuation and continuation["doc_id"] == neighbor["doc_id"]
+                    text = neighbor["text"]
+                    if valid_continuation:
+                        text += " " + continuation["text"]
+                    group_results.append({
+                        "text": text,
+                        "doc_id": neighbor["doc_id"]
+                    })
+                results.append(group_results)
+        else:
+            for result in _results:
+                group_results = []
+                for hit in result:
+                    group_results.append({
+                        "text": hit.entity.get("text"),
+                        "doc_id": hit.entity.get("doc_id")
+                    })
+                results.append(group_results)
+            
+        # Process neighbors
+        def _process(result, chunk_text):
+            processed_tokens = []
+            for hit in result:
+                text = hit["text"]
+                tokens = self.tokenizer.encode(text)[:self.neighbor_size]
+                padding_len = self.neighbor_size - len(tokens)
+                if padding_len > 0:
+                    tokens.extend([PAD_TOKEN_ID] * padding_len)
+                processed_tokens.append(tokens)
+            return processed_tokens
+        
+        # Note: I tried ThreadPoolExecutor but this is faster, esp with prefetching
+        neighbor_tokens = [
+            _process(result, idx_chunks_flat_decoded[i])
+            for i, result in enumerate(results)
+        ]
+        # Shape: (B_n_chunks, k_neighbors, neighbor_size)
+        
+        return torch.tensor(neighbor_tokens, device=device).view(
+            B, n_chunks, self.k_neighbors, self.neighbor_size
+        )
+
+class AsyncRetrieverManager:
+    def __init__(self, config):
+        self.lock = Lock()
+        self.retriever = NeighborRetriever(config)
+        self.prefetch_executor = concurrent.futures.ThreadPoolExecutor(max_workers=multiprocessing.cpu_count() // 2)
+        self.prefetch_futures = {}
+
+    def prefetch_neighbors(self, idx, doc_ids, key):
+        with self.lock:
+            self.prefetch_futures[key] = self.prefetch_executor.submit(self.retriever, idx, doc_ids)
+
+    @torch._dynamo.disable
+    def get_neighbors(self, idx, doc_ids, prefetch_key=None):
+        if prefetch_key is not None:
+            with self.lock:
+                future = self.prefetch_futures.pop(prefetch_key, None)
+                if future is not None:
+                    return future.result()
+        return self.retriever(idx, doc_ids)
+
+    def __del__(self):
+        self.prefetch_executor.shutdown()
+
+class NeighborEncoderLayer(nn.Module):
+
+    def __init__(self, config, use_cross_attention=True):
+        super().__init__()
+        self.use_cross_attention = use_cross_attention
+
+        # Self attention
+        self.ln_self = LayerNorm(config.n_embd, bias=config.bias)
+        self.self_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.self_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        
+        # Cross attention
+        if use_cross_attention:
+            self.ln_cross = LayerNorm(config.n_embd, bias=config.bias)
+            self.cross_attn_q = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+            self.cross_attn_kv = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
+            self.cross_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
+        # MLP
+        self.ln_mlp = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+        
+        self.n_head = config.n_head
+        self.dropout_p = config.dropout
+
+    def forward(self, x, h=None):
+        """
+        x: Tensor of shape (B * n_chunks * k_neighbors, neighbor_size, C)
+        h: Tensor of shape (B * n_chunks * k_neighbors, chunk_size, C) or None
+        """
+        bnk, neighbor_size, C = x.size()
+
+        # Self-attention
+        residual = x
+        x = self.ln_self(x)
+        
+        q, k, v = self.self_attn(x).split(C, dim=2)
+        q = q.view(bnk, neighbor_size, self.n_head, C // self.n_head).transpose(1, 2)
+        k = k.view(bnk, neighbor_size, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(bnk, neighbor_size, self.n_head, C // self.n_head).transpose(1, 2)
+        x = F.scaled_dot_product_attention(
+            q, k, v,
+            is_causal=False,
+            dropout_p=self.dropout_p if self.training else 0,
+        )
+        
+        x = x.transpose(1, 2).contiguous().view(bnk, neighbor_size, C)
+        x = self.self_proj(x)
+        x = residual + x
+
+        # Cross-attention
+        if self.use_cross_attention:
+            assert h is not None
+            _, chunk_size, _ = h.size()
+            
+            residual = x
+            x = self.ln_cross(x)
+            
+            q = self.cross_attn_q(x)
+            k, v = self.cross_attn_kv(h).split(C, dim=2)
+            q = q.view(bnk, neighbor_size, self.n_head, C // self.n_head).transpose(1, 2)
+            k = k.view(bnk, chunk_size, self.n_head, C // self.n_head).transpose(1, 2)
+            v = v.view(bnk, chunk_size, self.n_head, C // self.n_head).transpose(1, 2)
+            x = F.scaled_dot_product_attention(
+                q, k, v,
+                is_causal=False,
+                dropout_p=self.dropout_p if self.training else 0,
+            )
+            
+            x = x.transpose(1, 2).contiguous().view(bnk, neighbor_size, C)
+            x = self.cross_proj(x)
+            x = residual + x
+
+        # MLP
+        residual = x
+        x = self.mlp(self.ln_mlp(x))
+        x = residual + x
+
+        return x
+
+class NeighborEncoder(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.chunk_size = config.retrieval_chunk_size
+        self.tokenizer = tiktoken.get_encoding(config.tokenizer)
+
+        self.wte = nn.Embedding(
+            config.vocab_size,
+            config.n_embd
+        )
+
+        self.wpe = nn.Embedding(
+            config.retrieval_neighbor_size,
+            config.n_embd
+        )
+
+        self.wne = nn.Embedding(
+            config.retrieval_k_neighbors,
+            config.n_embd
+        )
+
+        cross_attention_layers = set(config.retrieval_neighbor_encoder_cross_attn_layers)
+        self.layers = nn.ModuleList([
+            NeighborEncoderLayer(
+                config,
+                use_cross_attention=(layer_idx in cross_attention_layers)
+            )
+            for layer_idx in range(config.retrieval_neighbor_encoder_n_layer)
+        ])
+
+    def forward(self, neighbor_tokens, hidden_states):
+        """
+        neighbor_tokens: Tensor of shape (B, n_chunks, k_neighbors, neighbor_size)
+        hidden_states: Tensor of shape (B, T, C)
+        """
+        B, n_chunks, k_neighbors, neighbor_size = neighbor_tokens.size()
+        bnk = B * n_chunks * k_neighbors
+        _, _, C = hidden_states.size()
+        device = hidden_states.device
+
+        # Flatten neighbor_tokens for efficient processing
+        neighbor_tokens = neighbor_tokens.view(bnk, neighbor_size)
+        
+        # Embed tokens
+        te = self.wte(neighbor_tokens)
+        
+        pos = torch.arange(neighbor_size, device=device) # abs pos embeddings for simplicity
+        pe = self.wpe(pos)
+        
+        npos = torch.arange(k_neighbors, device=device)
+        ne = self.wne(npos)
+        ne = ne.unsqueeze(1).expand(-1, neighbor_size, -1)
+        ne = ne.repeat(B * n_chunks, 1, 1)
+        
+        x = te + pe + ne
+
+        # Chunk hidden states and match neighbor_tokens shape
+        hidden_states_chunks = hidden_states.view(B, n_chunks, self.chunk_size, C)
+        h = hidden_states_chunks.unsqueeze(2).expand(
+            B, n_chunks, k_neighbors, self.chunk_size, C
+        ).contiguous().view(bnk, self.chunk_size, C)
+        
+        # Process layers
+        for layer in self.layers:
+            x = layer(x, h)
+
+        # Restore original shape
+        x = x.view(B, n_chunks, k_neighbors, neighbor_size, C)
+
+        return x
+
+class CrossAttention(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.chunk_size = config.retrieval_chunk_size
+
+        self.ln_hs = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_ne = LayerNorm(config.n_embd, bias=config.bias)
+
+        self.cross_attn_q = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.cross_attn_kv = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
+        self.cross_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        
+        self.dropout = nn.Dropout(config.dropout)
+        
+        self.n_head = config.n_head
+        self.dropout_p = config.dropout
+
+    def forward(self, hidden_states, neighbor_embeddings):
+        """
+        hidden_states: Tensor of shape (B, T, C)
+        neighbor_embeddings: Tensor of shape (B, n_chunks, k_neighbors, neighbor_size, C)
+        """
+        B, n_chunks, k_neighbors, neighbor_size, C = neighbor_embeddings.size()
+        _, T, _ = hidden_states.size()
+        device = hidden_states.device
+
+        # Apply LayerNorm
+        hidden_states = self.ln_hs(hidden_states)  # (B, T, C)
+        neighbor_embeddings = self.ln_ne(neighbor_embeddings)  # (B, n_chunks, k_neighbors, neighbor_size, C)
+
+        # Shift hidden_states to maintain causality (as in paper)
+        shift_amount = self.chunk_size - 1
+        hidden_states_shifted = hidden_states[:, shift_amount:, :]  # (B, T-shift_amount, C)
+        hidden_states_shifted = F.pad(hidden_states_shifted, (0, 0, 0, shift_amount))  # (B, T, C)
+
+        # Reshape shifted hidden states into chunks
+        hidden_states_shifted_chunks = hidden_states_shifted.view(B, n_chunks, self.chunk_size, C)  # (B, n_chunks, chunk_size, C)
+
+        # Compute query, key, and value projections
+        q = self.cross_attn_q(hidden_states_shifted_chunks)  # (B, n_chunks, chunk_size, C)
+        k, v = self.cross_attn_kv(neighbor_embeddings).split(C, dim=4)  # each: (B, n_chunks, k_neighbors, neighbor_size, C)
+        
+        # Reshape for multi-head attention
+        head_dim = C // self.n_head
+        q = q.view(B * n_chunks, self.chunk_size, self.n_head, head_dim).transpose(1, 2)  # (B*n_chunks, n_head, chunk_size, head_dim)
+        k = k.view(B * n_chunks, k_neighbors * neighbor_size, self.n_head, head_dim).transpose(1, 2)  # (B*n_chunks, n_head, k_neighbors*neighbor_size, head_dim)
+        v = v.view(B * n_chunks, k_neighbors * neighbor_size, self.n_head, head_dim).transpose(1, 2)  # (B*n_chunks, n_head, k_neighbors*neighbor_size, head_dim)
+        
+        # Compute scaled dot-product attention
+        x = F.scaled_dot_product_attention(
+            q, k, v,
+            is_causal=False,
+            dropout_p=self.dropout_p if self.training else 0,
+        )  # (B*n_chunks, n_head, chunk_size, head_dim)
+        
+        # Merge heads and apply output projection
+        x = x.transpose(1, 2).contiguous().view(B * n_chunks, self.chunk_size, C)  # (B * n_chunks, chunk_size, C)
+        x = self.cross_proj(x)  # (B * n_chunks, chunk_size, C)
+        
+        # De-chunk and un-shift
+        x = x.view(B, T, C)  # (B, T, C)
+        x = torch.cat([
+            torch.zeros(B, shift_amount, C, device=device),  # identity for dropped tokens, as in paper
+            x[:, :-shift_amount, :]
+        ], dim=1)  # (B, T, C)
+        
+        # Apply dropout
+        x = self.dropout(x)  # (B, T, C)
+
         return x
 
 @dataclass
@@ -99,6 +512,18 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    use_retrieval: bool = False
+    retrieval_layers: list = (5, 8, 11)
+    retrieval_chunk_size: int = 64
+    retrieval_embedding_model: str = 'sentence-transformers/all-mpnet-base-v2'
+    retrieval_milvus_host: str = "localhost"
+    retrieval_milvus_port: str = "19530"
+    retrieval_milvus_collection_name: str = "omnikb_64_gpt2"
+    retrieval_k_neighbors: int = 2
+    retrieval_neighbor_size: int = 128
+    retrieval_neighbor_continuations: bool = True
+    retrieval_neighbor_encoder_n_layer: int = 2
+    retrieval_neighbor_encoder_cross_attn_layers: list = (0, 1)
 
 class GPT(nn.Module):
 
@@ -123,6 +548,15 @@ class GPT(nn.Module):
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
+        # instantiate retrieval modules
+        self.retrieval_enabled = config.use_retrieval
+        if self.retrieval_enabled:
+            self.retriever_manager = AsyncRetrieverManager(config)
+            self.neighbor_encoder = NeighborEncoder(config)
+            self.cross_attention_modules = nn.ModuleList([
+                CrossAttention(config) for _ in config.retrieval_layers
+            ])
+            
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -164,7 +598,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, doc_ids=None, prefetched_neighbors_key=None, debug=False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -174,10 +608,33 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+
+        # process retrieval once for all retrieval modules
+        if self.retrieval_enabled:
+            assert doc_ids is not None, "doc_ids must be provided when using retrieval."
+            retrieval_layers = set(self.config.retrieval_layers)
+            first_retrieval_layer = min(retrieval_layers)
+            neighbor_tokens = self.retriever_manager.get_neighbors(idx, doc_ids, prefetched_neighbors_key)
+
+        # transformer blocks with interleaved retrieval
+        retrieval_layer_index = 0
+        neighbor_embeddings = None
+        for layer_index, block in enumerate(self.transformer['h']):
+            cross_attention_module = None
+            if self.retrieval_enabled:
+                # encode neighbors at first retrieval layer
+                if layer_index == first_retrieval_layer:
+                    neighbor_embeddings = self.neighbor_encoder(neighbor_tokens, x)
+                # apply cross attention at retrieval layers
+                if layer_index in retrieval_layers:
+                    cross_attention_module = self.cross_attention_modules[retrieval_layer_index]
+                    retrieval_layer_index += 1
+            x = block(x, cross_attention_module, neighbor_embeddings)
+
+        # layer norm
         x = self.transformer.ln_f(x)
 
+        # output
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
@@ -186,6 +643,45 @@ class GPT(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
+
+        if debug:
+            # print each input, neighbors, and output
+            print("\n===== Debug Output =====")
+
+            # Ensure idx is 2D for debug output
+            debug_idx = idx.unsqueeze(0) if idx.dim() == 1 else idx
+            
+            # Print input text
+            for b in range(len(debug_idx)):
+                print(f"\n==== Batch {b} ====")
+                print(f"\n=== Input text ===\n{self.tokenizer.decode(debug_idx[b].tolist())}")
+                
+                # Print retrieved neighbors if retrieval is enabled
+                if self.retrieval_enabled:
+                    print("\n=== Retrieved neighbors ===")
+                    n_chunks = len(debug_idx[b]) // self.config.retrieval_chunk_size
+                    for chunk in range(n_chunks):
+                        print(f"\n== Chunk {chunk} ==")
+                        for k in range(self.config.retrieval_k_neighbors):
+                            neighbor_tokens_for_chunk = neighbor_tokens[b][chunk][k]
+                            # Filter out padding tokens
+                            valid_tokens = [t for t in neighbor_tokens_for_chunk.tolist() if t != PAD_TOKEN_ID]
+                            neighbor_text = self.tokenizer.decode(valid_tokens)
+                            print(f"  Neighbor {k}: {neighbor_text}")
+                
+                # Print output logits/predictions
+                if targets is None: # Generation mode
+                    top_k = 5
+                    last_logits = logits[b, -1]
+                    top_probs, top_indices = torch.topk(F.softmax(last_logits, dim=-1), top_k)
+                    print("\n=== Top predictions for next token ===")
+                    for prob, idx in zip(top_probs.tolist(), top_indices.tolist()):
+                        token_text = self.tokenizer.decode([idx])
+                        print(f"  {token_text!r}: {prob:.3f}")
+                else: # Training mode
+                    print("\n=== Training loss ===\n", loss.item())
+            
+            print("\n===== End Debug Output =====")
 
         return logits, loss
 
@@ -204,8 +700,23 @@ class GPT(nn.Module):
     def from_pretrained(cls, model_type, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
-        # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
+        # only dropout and retrieval params can be overridden
+        allowed_override_args = {
+            'dropout',
+            'use_retrieval',
+            'retrieval_layers',
+            'retrieval_chunk_size',
+            'retrieval_embedding_model',
+            'retrieval_milvus_host',
+            'retrieval_milvus_port',
+            'retrieval_milvus_collection_name',
+            'retrieval_k_neighbors',
+            'retrieval_neighbor_size',
+            'retrieval_neighbor_continuations',
+            'retrieval_neighbor_encoder_n_layer',
+            'retrieval_neighbor_encoder_cross_attn_layers',
+        }
+        assert all(k in allowed_override_args for k in override_args), f"Only {allowed_override_args} can be overridden"
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
@@ -220,16 +731,23 @@ class GPT(nn.Module):
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
         config_args['bias'] = True # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
-        if 'dropout' in override_args:
-            print(f"overriding dropout rate to {override_args['dropout']}")
-            config_args['dropout'] = override_args['dropout']
+        # apply any overrides
+        for k, v in override_args.items():
+            config_args[k] = v
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+        sd_keys = [
+            k 
+            for k in sd_keys
+            if not k.endswith('.attn.bias') # discard this mask / buffer, not a param
+            and not any(
+                k.startswith(x)
+                for x in ['retriever_manager', 'neighbor_encoder', 'cross_attention_modules'] # ignore retrieval layers
+            )
+        ]
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
@@ -299,6 +817,19 @@ class GPT(nn.Module):
         mfu = flops_achieved / flops_promised
         return mfu
 
+    def pad_to_chunk_size(self, idx):
+        """Pad sequence to be multiple of chunk_size if retrieval is enabled"""
+        if not self.retrieval_enabled:
+            return idx
+        
+        chunk_size = self.config.retrieval_chunk_size
+        if idx.size(1) % chunk_size == 0:
+            return idx
+        
+        pad_length = chunk_size - (idx.size(1) % chunk_size)
+        padding = torch.full((idx.size(0), pad_length), PAD_TOKEN_ID, dtype=idx.dtype, device=idx.device)
+        return torch.cat([padding, idx], dim=1) # left pad to preserve the original sequence
+
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
@@ -309,8 +840,10 @@ class GPT(nn.Module):
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # Pad the input sequence to be a multiple of chunk_size if retrieval is enabled
+            idx_cond = self.pad_to_chunk_size(idx_cond)
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _ = self(idx_cond, doc_ids=[]) # input idx not associated with any docs
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options

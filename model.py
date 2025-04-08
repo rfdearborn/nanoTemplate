@@ -7,6 +7,7 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
+from collections import OrderedDict
 import concurrent.futures
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -137,6 +138,9 @@ class NeighborRetriever(nn.Module):
         self.chunk_encoder = get_retriever_chunk_encoder(config.retrieval_embedding_model)
         self.embedding_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
+        self._neighbor_token_cache = OrderedDict()
+        self._neighbor_token_cache_max_size = 10000
+
     def __del__(self):
         connections.disconnect("default")
         print("Disconnected from Milvus server")
@@ -235,9 +239,29 @@ class NeighborRetriever(nn.Module):
         # Process neighbors
         def _process(result, chunk_text):
             processed_tokens = []
-            for hit in result:
-                text = hit["text"]
-                tokens = self.tokenizer.encode(text)[:self.neighbor_size]
+            for i in range(self.k_neighbors):
+                if i < len(result):
+                    hit = result[i]
+                    text = hit["text"]
+                    # Trim to avoid unnecessary encoding, assuming 4 chars per token plus 10% buffer
+                    # Then encode and truncate to exact token length needed
+                    trim_pos = int(4 * self.neighbor_size * 1.1)
+                    trimmed_text = text[:trim_pos]
+                    # Check cache and update using LRU strategy
+                    use_cache = self._neighbor_token_cache_max_size > 0
+                    if use_cache and trimmed_text in self._neighbor_token_cache:
+                        tokens = self._neighbor_token_cache[trimmed_text]
+                        self._neighbor_token_cache.move_to_end(trimmed_text)
+                    else:
+                        tokens = self.tokenizer.encode(trimmed_text)[:self.neighbor_size]
+                        if use_cache:
+                            self._neighbor_token_cache[trimmed_text] = tokens
+                            if len(self._neighbor_token_cache) > self._neighbor_token_cache_max_size:
+                                self._neighbor_token_cache.popitem(last=False)
+                else:
+                    # Pad with empty result if we don't have enough neighbors
+                    tokens = []
+                # Pad tokens to neighbor_size if necessary
                 padding_len = self.neighbor_size - len(tokens)
                 if padding_len > 0:
                     tokens.extend([PAD_TOKEN_ID] * padding_len)

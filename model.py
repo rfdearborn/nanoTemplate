@@ -302,91 +302,12 @@ class AsyncRetrieverManager:
     def __del__(self):
         self.prefetch_executor.shutdown()
 
-class NeighborEncoderLayer(nn.Module):
-
-    def __init__(self, config, use_cross_attention=True):
-        super().__init__()
-        self.use_cross_attention = use_cross_attention
-
-        # Self attention
-        self.ln_self = LayerNorm(config.n_embd, bias=config.bias)
-        self.self_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        self.self_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        
-        # Cross attention
-        if use_cross_attention:
-            self.ln_cross = LayerNorm(config.n_embd, bias=config.bias)
-            self.cross_attn_q = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-            self.cross_attn_kv = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
-            self.cross_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-
-        # MLP
-        self.ln_mlp = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
-        
-        self.n_head = config.n_head
-        self.dropout_p = config.dropout
-
-    def forward(self, x, h=None):
-        """
-        x: Tensor of shape (B * n_chunks * k_neighbors, neighbor_size, C)
-        h: Tensor of shape (B * n_chunks * k_neighbors, chunk_size, C) or None
-        """
-        bnk, neighbor_size, C = x.size()
-
-        # Self-attention
-        residual = x
-        x = self.ln_self(x)
-        
-        q, k, v = self.self_attn(x).split(C, dim=2)
-        q = q.view(bnk, neighbor_size, self.n_head, C // self.n_head).transpose(1, 2)
-        k = k.view(bnk, neighbor_size, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(bnk, neighbor_size, self.n_head, C // self.n_head).transpose(1, 2)
-        x = F.scaled_dot_product_attention(
-            q, k, v,
-            is_causal=False,
-            dropout_p=self.dropout_p if self.training else 0,
-        )
-        
-        x = x.transpose(1, 2).contiguous().view(bnk, neighbor_size, C)
-        x = self.self_proj(x)
-        x = residual + x
-
-        # Cross-attention
-        if self.use_cross_attention:
-            assert h is not None
-            _, chunk_size, _ = h.size()
-            
-            residual = x
-            x = self.ln_cross(x)
-            
-            q = self.cross_attn_q(x)
-            k, v = self.cross_attn_kv(h).split(C, dim=2)
-            q = q.view(bnk, neighbor_size, self.n_head, C // self.n_head).transpose(1, 2)
-            k = k.view(bnk, chunk_size, self.n_head, C // self.n_head).transpose(1, 2)
-            v = v.view(bnk, chunk_size, self.n_head, C // self.n_head).transpose(1, 2)
-            x = F.scaled_dot_product_attention(
-                q, k, v,
-                is_causal=False,
-                dropout_p=self.dropout_p if self.training else 0,
-            )
-            
-            x = x.transpose(1, 2).contiguous().view(bnk, neighbor_size, C)
-            x = self.cross_proj(x)
-            x = residual + x
-
-        # MLP
-        residual = x
-        x = self.mlp(self.ln_mlp(x))
-        x = residual + x
-
-        return x
-
 class NeighborEncoder(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.chunk_size = config.retrieval_chunk_size
+        self.n_embd = config.n_embd
         self.tokenizer = tiktoken.get_encoding(config.tokenizer)
 
         self.wte = nn.Embedding(
@@ -404,24 +325,13 @@ class NeighborEncoder(nn.Module):
             config.n_embd
         )
 
-        cross_attention_layers = set(config.retrieval_neighbor_encoder_cross_attn_layers)
-        self.layers = nn.ModuleList([
-            NeighborEncoderLayer(
-                config,
-                use_cross_attention=(layer_idx in cross_attention_layers)
-            )
-            for layer_idx in range(config.retrieval_neighbor_encoder_n_layer)
-        ])
-
-    def forward(self, neighbor_tokens, hidden_states):
+    def forward(self, neighbor_tokens):
         """
         neighbor_tokens: Tensor of shape (B, n_chunks, k_neighbors, neighbor_size)
-        hidden_states: Tensor of shape (B, T, C)
         """
         B, n_chunks, k_neighbors, neighbor_size = neighbor_tokens.size()
         bnk = B * n_chunks * k_neighbors
-        _, _, C = hidden_states.size()
-        device = hidden_states.device
+        device = neighbor_tokens.device
 
         # Flatten neighbor_tokens for efficient processing
         neighbor_tokens = neighbor_tokens.view(bnk, neighbor_size)
@@ -439,18 +349,7 @@ class NeighborEncoder(nn.Module):
         
         x = te + pe + ne
 
-        # Chunk hidden states and match neighbor_tokens shape
-        hidden_states_chunks = hidden_states.view(B, n_chunks, self.chunk_size, C)
-        h = hidden_states_chunks.unsqueeze(2).expand(
-            B, n_chunks, k_neighbors, self.chunk_size, C
-        ).contiguous().view(bnk, self.chunk_size, C)
-        
-        # Process layers
-        for layer in self.layers:
-            x = layer(x, h)
-
-        # Restore original shape
-        x = x.view(B, n_chunks, k_neighbors, neighbor_size, C)
+        x = x.view(B, n_chunks, k_neighbors, neighbor_size, self.n_embd)
 
         return x
 
@@ -546,8 +445,6 @@ class GPTConfig:
     retrieval_k_neighbors: int = 2
     retrieval_neighbor_size: int = 128
     retrieval_neighbor_continuations: bool = True
-    retrieval_neighbor_encoder_n_layer: int = 2
-    retrieval_neighbor_encoder_cross_attn_layers: list = (0, 1)
 
 class GPT(nn.Module):
 
@@ -648,7 +545,7 @@ class GPT(nn.Module):
             if self.retrieval_enabled:
                 # encode neighbors at first retrieval layer
                 if layer_index == first_retrieval_layer:
-                    neighbor_embeddings = self.neighbor_encoder(neighbor_tokens, x)
+                    neighbor_embeddings = self.neighbor_encoder(neighbor_tokens)
                 # apply cross attention at retrieval layers
                 if layer_index in retrieval_layers:
                     cross_attention_module = self.cross_attention_modules[retrieval_layer_index]
@@ -737,8 +634,6 @@ class GPT(nn.Module):
             'retrieval_k_neighbors',
             'retrieval_neighbor_size',
             'retrieval_neighbor_continuations',
-            'retrieval_neighbor_encoder_n_layer',
-            'retrieval_neighbor_encoder_cross_attn_layers',
         }
         assert all(k in allowed_override_args for k in override_args), f"Only {allowed_override_args} can be overridden"
         from transformers import GPT2LMHeadModel

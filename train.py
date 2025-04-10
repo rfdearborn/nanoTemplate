@@ -133,8 +133,6 @@ retrieval_milvus_collection_name = 'omnikb_64_gpt2'  # Milvus collection name
 retrieval_k_neighbors = 2  # Number of neighbors to retrieve
 retrieval_neighbor_size = 128 # Maximum sequence length for neighbor encoder
 retrieval_neighbor_continuations = True # Whether to extend retrieved neighbors with next records
-retrieval_neighbor_encoder_n_layer = 2 # Number of layers in the neighbor encoder
-retrieval_neighbor_encoder_cross_attn_layers = (0, 1) # Layers at which to apply cross-attention in neighbor encoder
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -326,8 +324,6 @@ model_args = dict(
     retrieval_k_neighbors=retrieval_k_neighbors,
     retrieval_neighbor_size=retrieval_neighbor_size,
     retrieval_neighbor_continuations=retrieval_neighbor_continuations,
-    retrieval_neighbor_encoder_n_layer=retrieval_neighbor_encoder_n_layer,
-    retrieval_neighbor_encoder_cross_attn_layers=retrieval_neighbor_encoder_cross_attn_layers,
 ) # start with model_args from command line
 gptconf = GPTConfig(**model_args)
 if init_from == 'scratch':
@@ -368,8 +364,6 @@ elif init_from.startswith('gpt2'):
         retrieval_k_neighbors=retrieval_k_neighbors,
         retrieval_neighbor_size=retrieval_neighbor_size,
         retrieval_neighbor_continuations=retrieval_neighbor_continuations,
-        retrieval_neighbor_encoder_n_layer=retrieval_neighbor_encoder_n_layer,
-        retrieval_neighbor_encoder_cross_attn_layers=retrieval_neighbor_encoder_cross_attn_layers,
     )
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly

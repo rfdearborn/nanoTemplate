@@ -91,11 +91,11 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, cross_attention_module=None, neighbor_embeddings=None):
+    def forward(self, x, cross_attention_module=None, neighbor_kv=None):
         x = x + self.attn(self.ln_1(x))
         if cross_attention_module is not None:
-            assert neighbor_embeddings is not None
-            x = x + cross_attention_module(x, neighbor_embeddings)
+            assert neighbor_kv is not None, "neighbor_kv must be provided when using cross attention"
+            x = x + cross_attention_module(x, neighbor_kv)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -353,6 +353,17 @@ class NeighborEncoder(nn.Module):
 
         return x
 
+class NeighborKVProjection(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln_ne = LayerNorm(config.n_embd, bias=config.bias)
+        self.cross_attn_kv = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
+
+    def forward(self, neighbor_embeddings):
+        neighbor_embeddings_norm = self.ln_ne(neighbor_embeddings)
+        neighbor_kv = self.cross_attn_kv(neighbor_embeddings_norm)
+        return neighbor_kv
+
 class CrossAttention(nn.Module):
 
     def __init__(self, config):
@@ -360,10 +371,8 @@ class CrossAttention(nn.Module):
         self.chunk_size = config.retrieval_chunk_size
 
         self.ln_hs = LayerNorm(config.n_embd, bias=config.bias)
-        self.ln_ne = LayerNorm(config.n_embd, bias=config.bias)
 
         self.cross_attn_q = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.cross_attn_kv = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
         self.cross_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         
         self.dropout = nn.Dropout(config.dropout)
@@ -371,18 +380,18 @@ class CrossAttention(nn.Module):
         self.n_head = config.n_head
         self.dropout_p = config.dropout
 
-    def forward(self, hidden_states, neighbor_embeddings):
+    def forward(self, hidden_states, neighbor_kv):
         """
         hidden_states: Tensor of shape (B, T, C)
-        neighbor_embeddings: Tensor of shape (B, n_chunks, k_neighbors, neighbor_size, C)
+        neighbor_kv: Tensor of shape (B, n_chunks, k_neighbors, neighbor_size, 2 * C)
         """
-        B, n_chunks, k_neighbors, neighbor_size, C = neighbor_embeddings.size()
+        B, n_chunks, k_neighbors, neighbor_size, two_C = neighbor_kv.size()
+        C = two_C // 2
         _, T, _ = hidden_states.size()
         device = hidden_states.device
 
         # Apply LayerNorm
         hidden_states = self.ln_hs(hidden_states)  # (B, T, C)
-        neighbor_embeddings = self.ln_ne(neighbor_embeddings)  # (B, n_chunks, k_neighbors, neighbor_size, C)
 
         # Shift hidden_states to maintain causality (as in paper)
         shift_amount = self.chunk_size - 1
@@ -392,10 +401,12 @@ class CrossAttention(nn.Module):
         # Reshape shifted hidden states into chunks
         hidden_states_shifted_chunks = hidden_states_shifted.view(B, n_chunks, self.chunk_size, C)  # (B, n_chunks, chunk_size, C)
 
-        # Compute query, key, and value projections
+        # Compute query projection
         q = self.cross_attn_q(hidden_states_shifted_chunks)  # (B, n_chunks, chunk_size, C)
-        k, v = self.cross_attn_kv(neighbor_embeddings).split(C, dim=4)  # each: (B, n_chunks, k_neighbors, neighbor_size, C)
-        
+
+        # Unpack precomputed neighbor_kv
+        k, v = neighbor_kv.split(C, dim=4)  # each: (B, n_chunks, k_neighbors, neighbor_size, C)
+
         # Reshape for multi-head attention
         head_dim = C // self.n_head
         q = q.view(B * n_chunks, self.chunk_size, self.n_head, head_dim).transpose(1, 2)  # (B*n_chunks, n_head, chunk_size, head_dim)
@@ -474,6 +485,7 @@ class GPT(nn.Module):
         if self.retrieval_enabled:
             self.retriever_manager = AsyncRetrieverManager(config)
             self.neighbor_encoder = NeighborEncoder(config)
+            self.neighbor_kv_projection = NeighborKVProjection(config)
             self.cross_attention_modules = nn.ModuleList([
                 CrossAttention(config) for _ in config.retrieval_layers
             ])
@@ -539,18 +551,19 @@ class GPT(nn.Module):
 
         # transformer blocks with interleaved retrieval
         retrieval_layer_index = 0
-        neighbor_embeddings = None
+        neighbor_kv = None
         for layer_index, block in enumerate(self.transformer['h']):
             cross_attention_module = None
             if self.retrieval_enabled:
                 # encode neighbors at first retrieval layer
                 if layer_index == first_retrieval_layer:
                     neighbor_embeddings = self.neighbor_encoder(neighbor_tokens)
+                    neighbor_kv = self.neighbor_kv_projection(neighbor_embeddings)
                 # apply cross attention at retrieval layers
                 if layer_index in retrieval_layers:
                     cross_attention_module = self.cross_attention_modules[retrieval_layer_index]
                     retrieval_layer_index += 1
-            x = block(x, cross_attention_module, neighbor_embeddings)
+            x = block(x, cross_attention_module, neighbor_kv)
 
         # layer norm
         x = self.transformer.ln_f(x)

@@ -237,7 +237,7 @@ class NeighborRetriever(nn.Module):
                 results.append(group_results)
             
         # Process neighbors
-        def _process(result, chunk_text):
+        def _process(result):
             processed_tokens = []
             for i in range(self.k_neighbors):
                 if i < len(result):
@@ -269,10 +269,7 @@ class NeighborRetriever(nn.Module):
             return processed_tokens
         
         # Note: I tried ThreadPoolExecutor but this is faster, esp with prefetching
-        neighbor_tokens = [
-            _process(result, idx_chunks_flat_decoded[i])
-            for i, result in enumerate(results)
-        ]
+        neighbor_tokens = [_process(result) for result in results]
         # Shape: (B_n_chunks, k_neighbors, neighbor_size)
         
         return torch.tensor(neighbor_tokens, device=device).view(
@@ -452,7 +449,7 @@ class GPTConfig:
     retrieval_embedding_model: str = 'sentence-transformers/all-mpnet-base-v2'
     retrieval_milvus_host: str = "localhost"
     retrieval_milvus_port: str = "19530"
-    retrieval_milvus_collection_name: str = "omnikb_64_gpt2"
+    retrieval_milvus_collection_name: str = "omnikb_64_gpt2_with_continuations"
     retrieval_k_neighbors: int = 2
     retrieval_neighbor_size: int = 128
     retrieval_neighbor_continuations: bool = True
@@ -677,7 +674,7 @@ class GPT(nn.Module):
             if not k.endswith('.attn.bias') # discard this mask / buffer, not a param
             and not any(
                 k.startswith(x)
-                for x in ['retriever_manager', 'neighbor_encoder', 'cross_attention_modules'] # ignore retrieval layers
+                for x in ['retriever_manager', 'neighbor_encoder', 'neighbor_kv_projection', 'cross_attention_modules'] # ignore retrieval layers
             )
         ]
 

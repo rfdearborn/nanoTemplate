@@ -91,11 +91,12 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, cross_attention_module=None, neighbor_kv=None):
+    def forward(self, x, cross_attention_module=None, neighbor_kv=None, neighbor_attention_scalars=None):
         x = x + self.attn(self.ln_1(x))
         if cross_attention_module is not None:
             assert neighbor_kv is not None, "neighbor_kv must be provided when using cross attention"
-            x = x + cross_attention_module(x, neighbor_kv)
+            assert neighbor_attention_scalars is not None, "neighbor_attention_scalars must be provided when using cross attention"
+            x = x + cross_attention_module(x, neighbor_kv, neighbor_attention_scalars)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -110,6 +111,27 @@ def get_retriever_chunk_encoder(model_name):
 
 PAD_TOKEN_ID = 220 # tokenizer has no pad token; 220 is " "
 
+class QueryTransformer(nn.Module):
+    def __init__(self, config, input_dim=768, hidden_dim=1024, n_layers=2):
+        super().__init__()
+        layers = []
+        for i in range(n_layers):
+            in_d = input_dim if i == 0 else hidden_dim
+            out_d = input_dim if i == n_layers-1 else hidden_dim
+            layers.extend([
+                nn.Linear(in_d, out_d, bias=config.bias),
+                LayerNorm(out_d, bias=config.bias) if i < n_layers-1 else nn.Identity(),
+                nn.GELU() if i < n_layers-1 else nn.Identity()
+            ])
+        self.transform = nn.Sequential(*layers)
+        
+        # Initialize temperature to small value
+        self.temperature = nn.Parameter(torch.tensor(0.01))
+    
+    def forward(self, x):
+        # Residual connection ensures we start with original embeddings
+        return x + self.temperature * self.transform(x)
+
 @torch._dynamo.disable
 class NeighborRetriever(nn.Module):
 
@@ -121,7 +143,7 @@ class NeighborRetriever(nn.Module):
         )
         print(f"Connected to Milvus server at {config.retrieval_milvus_host}:{config.retrieval_milvus_port}")
 
-    def __init__(self, config):
+    def __init__(self, config, query_transformer):
         super().__init__()
         self.k_neighbors = config.retrieval_k_neighbors
         self.neighbor_size = config.retrieval_neighbor_size
@@ -137,6 +159,7 @@ class NeighborRetriever(nn.Module):
         self.tokenizer = tiktoken.get_encoding(config.tokenizer)
         self.chunk_encoder = get_retriever_chunk_encoder(config.retrieval_embedding_model)
         self.embedding_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self.query_transformer = query_transformer
 
         self._neighbor_token_cache = OrderedDict()
         self._neighbor_token_cache_max_size = 10000
@@ -169,13 +192,16 @@ class NeighborRetriever(nn.Module):
         ]
         # Shape: (B_n_chunks)
 
-        # Encode chunks for retrieval using dedicated stream for parallelization
+        # Encode and transform chunks for retrieval using dedicated stream for parallelization
         with torch.cuda.stream(self.embedding_stream) if self.embedding_stream else nullcontext():
-            query_embeddings_flat = self.chunk_encoder.encode(
+            raw_chunk_embeddings_flat = self.chunk_encoder.encode(
                 idx_chunks_flat_decoded,
                 convert_to_tensor=True,
                 batch_size=512 # diminishing returns beyond
-            ).cpu().numpy()
+            )
+            # Shape: (B_n_chunks, retrieval_embedding_model_dim)
+            
+            query_embeddings_flat = self.query_transformer(raw_chunk_embeddings_flat).detach().cpu().numpy()
             # Shape: (B_n_chunks, retrieval_embedding_model_dim)
 
         if self.embedding_stream:
@@ -184,7 +210,7 @@ class NeighborRetriever(nn.Module):
         # Retrieve neighbors
         excl_doc_ids = set().union(*doc_ids) # We trade a slight chance of false positives for native filtering
         expr = f"doc_id not in {list(excl_doc_ids)}" if excl_doc_ids else None
-        output_fields = ["id"] if self.use_continuations else ["doc_id", "text"]
+        output_fields = ["id"] if self.use_continuations else ["doc_id", "text", "vector"]
         _results = self.collection.search(
             data=query_embeddings_flat,
             anns_field="vector",
@@ -206,7 +232,7 @@ class NeighborRetriever(nn.Module):
             # Batch fetch all 
             _expanded_results = self.collection.query(
                 expr=f"id in {list(expanded_ids)}",
-                output_fields=["id", "doc_id", "text"]
+                output_fields=["id", "doc_id", "text", "vector"]
             )
             results_by_id = {str(c["id"]): c for c in _expanded_results}
             
@@ -223,7 +249,8 @@ class NeighborRetriever(nn.Module):
                         text += " " + continuation["text"]
                     group_results.append({
                         "text": text,
-                        "doc_id": neighbor["doc_id"]
+                        "doc_id": neighbor["doc_id"],
+                        "vector": neighbor["vector"]
                     })
                 results.append(group_results)
         else:
@@ -232,7 +259,8 @@ class NeighborRetriever(nn.Module):
                 for hit in result:
                     group_results.append({
                         "text": hit.entity.get("text"),
-                        "doc_id": hit.entity.get("doc_id")
+                        "doc_id": hit.entity.get("doc_id"),
+                        "vector": hit.entity.get("vector")
                     })
                 results.append(group_results)
             
@@ -269,17 +297,29 @@ class NeighborRetriever(nn.Module):
             return processed_tokens
         
         # Note: I tried ThreadPoolExecutor but this is faster, esp with prefetching
-        neighbor_tokens = [_process(result) for result in results]
-        # Shape: (B_n_chunks, k_neighbors, neighbor_size)
-        
-        return torch.tensor(neighbor_tokens, device=device).view(
-            B, n_chunks, self.k_neighbors, self.neighbor_size
+        neighbor_tokens = torch.tensor(
+            [_process(result) for result in results],
+            device=device
+        ).view(B, n_chunks, self.k_neighbors, self.neighbor_size)
+        # Shape: (B, n_chunks, k_neighbors, neighbor_size)
+
+        neighbor_vectors = torch.tensor(
+            [[hit["vector"] for hit in result] for result in results],
+            device=device
+        ).view(B, n_chunks, self.k_neighbors, -1)
+        # Shape: (B, n_chunks, k_neighbors, retrieval_embedding_model_dim)
+
+        raw_chunk_embeddings = torch.tensor(raw_chunk_embeddings_flat, device=device).view(
+            B, n_chunks, -1
         )
+        # Shape: (B, n_chunks, retrieval_embedding_model_dim)
+
+        return neighbor_tokens, neighbor_vectors, raw_chunk_embeddings
 
 class AsyncRetrieverManager:
-    def __init__(self, config):
+    def __init__(self, config, query_transformer):
         self.lock = Lock()
-        self.retriever = NeighborRetriever(config)
+        self.retriever = NeighborRetriever(config, query_transformer)
         self.prefetch_executor = concurrent.futures.ThreadPoolExecutor(max_workers=multiprocessing.cpu_count() // 2)
         self.prefetch_futures = {}
 
@@ -377,10 +417,11 @@ class CrossAttention(nn.Module):
         self.n_head = config.n_head
         self.dropout_p = config.dropout
 
-    def forward(self, hidden_states, neighbor_kv):
+    def forward(self, hidden_states, neighbor_kv, neighbor_attention_scalars):
         """
         hidden_states: Tensor of shape (B, T, C)
         neighbor_kv: Tensor of shape (B, n_chunks, k_neighbors, neighbor_size, 2 * C)
+        neighbor_attention_scalars: Tensor of shape (B, n_chunks, k_neighbors)
         """
         B, n_chunks, k_neighbors, neighbor_size, two_C = neighbor_kv.size()
         C = two_C // 2
@@ -403,6 +444,9 @@ class CrossAttention(nn.Module):
 
         # Unpack precomputed neighbor_kv
         k, v = neighbor_kv.split(C, dim=4)  # each: (B, n_chunks, k_neighbors, neighbor_size, C)
+        
+        # Scale neighbor values by attention
+        v = v * neighbor_attention_scalars.unsqueeze(-1).unsqueeze(-1)
 
         # Reshape for multi-head attention
         head_dim = C // self.n_head
@@ -480,7 +524,8 @@ class GPT(nn.Module):
         # instantiate retrieval modules
         self.retrieval_enabled = config.use_retrieval
         if self.retrieval_enabled:
-            self.retriever_manager = AsyncRetrieverManager(config)
+            self.query_transformer = QueryTransformer(config, 768, 1536, 2) # TODO: move to configs
+            self.retriever_manager = AsyncRetrieverManager(config, self.query_transformer)
             self.neighbor_encoder = NeighborEncoder(config)
             self.neighbor_kv_projection = NeighborKVProjection(config)
             self.cross_attention_modules = nn.ModuleList([
@@ -493,6 +538,10 @@ class GPT(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+        
+        # THEN do custom initialization for query transformer
+        if self.retrieval_enabled:
+            self._init_query_transformer()
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -527,6 +576,15 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def _init_query_transformer(self):
+        # Re-initialize just the query transformer components
+        for module in self.query_transformer.transform:
+            if isinstance(module, nn.Linear):
+                if module == self.query_transformer.transform[-3]:  # Last linear
+                    nn.init.normal_(module.weight, mean=0.0, std=0.001)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
 
     def forward(self, idx, targets=None, doc_ids=None, prefetched_neighbors_key=None, debug=False):
         device = idx.device
@@ -544,7 +602,16 @@ class GPT(nn.Module):
             assert doc_ids is not None, "doc_ids must be provided when using retrieval."
             retrieval_layers = set(self.config.retrieval_layers)
             first_retrieval_layer = min(retrieval_layers)
-            neighbor_tokens = self.retriever_manager.get_neighbors(idx, doc_ids, prefetched_neighbors_key)
+            neighbor_tokens, neighbor_vectors, raw_chunk_embeddings = self.retriever_manager.get_neighbors(idx, doc_ids, prefetched_neighbors_key)
+
+            # Scale by query <-> neighbor similarity
+            query_embeddings = self.query_transformer(raw_chunk_embeddings) # TODO: avoid recomputing this; for now it avoids async / graph complexity
+            query_embeddings_normalized = F.normalize(query_embeddings, dim=-1)
+            neighbor_vectors_normalized = F.normalize(neighbor_vectors, dim=-1)
+            query_neighbor_sims = torch.matmul(
+                query_embeddings_normalized.unsqueeze(2), neighbor_vectors_normalized.transpose(-1, -2)
+            ).squeeze(2)
+            neighbor_attention_scalars = torch.softmax(query_neighbor_sims, dim=2)
 
         # transformer blocks with interleaved retrieval
         retrieval_layer_index = 0
@@ -560,7 +627,7 @@ class GPT(nn.Module):
                 if layer_index in retrieval_layers:
                     cross_attention_module = self.cross_attention_modules[retrieval_layer_index]
                     retrieval_layer_index += 1
-            x = block(x, cross_attention_module, neighbor_kv)
+            x = block(x, cross_attention_module, neighbor_kv, neighbor_attention_scalars)
 
         # layer norm
         x = self.transformer.ln_f(x)
@@ -674,7 +741,7 @@ class GPT(nn.Module):
             if not k.endswith('.attn.bias') # discard this mask / buffer, not a param
             and not any(
                 k.startswith(x)
-                for x in ['retriever_manager', 'neighbor_encoder', 'neighbor_kv_projection', 'cross_attention_modules'] # ignore retrieval layers
+                for x in ['query_transformer', 'retriever_manager', 'neighbor_encoder', 'neighbor_kv_projection', 'cross_attention_modules'] # ignore retrieval layers
             )
         ]
 

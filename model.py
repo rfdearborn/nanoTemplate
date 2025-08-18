@@ -306,6 +306,8 @@ class NeighborEncoder(nn.Module):
         self.chunk_size = config.retrieval_chunk_size
         self.n_embd = config.n_embd
         self.tokenizer = tiktoken.get_encoding(config.tokenizer)
+        self.compressed_size = config.retrieval_compressed_size
+        self.compressor_layers = getattr(config, 'retrieval_compressor_layers', 1)
 
         self.wte = nn.Embedding(
             config.vocab_size,
@@ -322,9 +324,27 @@ class NeighborEncoder(nn.Module):
             config.n_embd
         )
 
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.n_embd,
+            nhead=config.n_head,
+            dropout=config.dropout,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=self.compressor_layers)
+
+        self.summary_queries = nn.Parameter(torch.randn(self.compressed_size, config.n_embd))
+        torch.nn.init.normal_(self.summary_queries, mean=0.0, std=0.02)
+        self.attn_pool = nn.MultiheadAttention(
+            embed_dim=config.n_embd,
+            num_heads=config.n_head,
+            dropout=config.dropout,
+            batch_first=True,
+        )
+
     def forward(self, neighbor_tokens):
         """
         neighbor_tokens: Tensor of shape (B, n_chunks, k_neighbors, neighbor_size)
+        Returns: Tensor of shape (B, n_chunks, k_neighbors, compressed_size, n_embd)
         """
         B, n_chunks, k_neighbors, neighbor_size = neighbor_tokens.size()
         bnk = B * n_chunks * k_neighbors
@@ -345,6 +365,12 @@ class NeighborEncoder(nn.Module):
         ne = ne.repeat(B * n_chunks, 1, 1)
         
         x = te + pe + ne
+
+        x = self.transformer(x)
+
+        queries = self.summary_queries.unsqueeze(0).expand(bnk, -1, -1)
+        x, _ = self.attn_pool(queries, x, x)
+        neighbor_size = self.compressed_size
 
         x = x.view(B, n_chunks, k_neighbors, neighbor_size, self.n_embd)
 
@@ -380,7 +406,7 @@ class CrossAttention(nn.Module):
     def forward(self, hidden_states, neighbor_kv):
         """
         hidden_states: Tensor of shape (B, T, C)
-        neighbor_kv: Tensor of shape (B, n_chunks, k_neighbors, neighbor_size, 2 * C)
+        neighbor_kv: Tensor of shape (B, n_chunks, k_neighbors, compressed_size, 2 * C)
         """
         B, n_chunks, k_neighbors, neighbor_size, two_C = neighbor_kv.size()
         C = two_C // 2
@@ -452,6 +478,8 @@ class GPTConfig:
     retrieval_milvus_collection_name: str = "omnikb_64_gpt2_with_continuations"
     retrieval_k_neighbors: int = 2
     retrieval_neighbor_size: int = 128
+    retrieval_compressor_layers: int = 1
+    retrieval_compressed_size: int = 32
     retrieval_neighbor_continuations: bool = True
 
 class GPT(nn.Module):

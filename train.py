@@ -132,6 +132,8 @@ retrieval_milvus_port = "19530" # Milvus port
 retrieval_milvus_collection_name = 'omnikb_64_gpt2_with_continuations'  # Milvus collection name
 retrieval_k_neighbors = 2  # Number of neighbors to retrieve
 retrieval_neighbor_size = 128 # Maximum sequence length for neighbor encoder
+retrieval_compressed_size = 16 # Final compressed length for neighbor encodings
+retrieval_transformer_layers = 2 # Number of transformer layers to use in neighbor compression
 retrieval_neighbor_continuations = True # Whether to extend retrieved neighbors with next records
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -323,6 +325,8 @@ model_args = dict(
     retrieval_milvus_collection_name=retrieval_milvus_collection_name,
     retrieval_k_neighbors=retrieval_k_neighbors,
     retrieval_neighbor_size=retrieval_neighbor_size,
+    retrieval_compressed_size=retrieval_compressed_size,
+    retrieval_transformer_layers=retrieval_transformer_layers,
     retrieval_neighbor_continuations=retrieval_neighbor_continuations,
 ) # start with model_args from command line
 gptconf = GPTConfig(**model_args)
@@ -363,6 +367,8 @@ elif init_from.startswith('gpt2'):
         retrieval_milvus_collection_name=retrieval_milvus_collection_name,
         retrieval_k_neighbors=retrieval_k_neighbors,
         retrieval_neighbor_size=retrieval_neighbor_size,
+        retrieval_compressed_size=retrieval_compressed_size,
+        retrieval_transformer_layers=retrieval_transformer_layers,
         retrieval_neighbor_continuations=retrieval_neighbor_continuations,
     )
     model = GPT.from_pretrained(init_from, override_args)

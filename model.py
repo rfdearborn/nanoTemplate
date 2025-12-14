@@ -306,6 +306,8 @@ class NeighborEncoder(nn.Module):
         self.chunk_size = config.retrieval_chunk_size
         self.n_embd = config.n_embd
         self.tokenizer = tiktoken.get_encoding(config.tokenizer)
+        self.neighbor_size = config.retrieval_neighbor_size
+        self.compressed_size = config.retrieval_compressed_size
 
         self.wte = nn.Embedding(
             config.vocab_size,
@@ -322,9 +324,25 @@ class NeighborEncoder(nn.Module):
             config.n_embd
         )
 
+        # These will be appended to the sequence to "absorb" the neighbor info
+        self.sink_tokens = nn.Parameter(torch.randn(self.compressed_size, config.n_embd))
+        torch.nn.init.normal_(self.sink_tokens, mean=0.0, std=0.02)
+
+        transformer_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.n_embd,
+            nhead=config.n_head,
+            bias=config.bias,
+            dropout=config.dropout,
+            activation=nn.GELU(),
+            norm_first=False, # Empirically required; Pre-LN likely causes neighbor representations to collapse; given shallow stack, reduced stability doesn't matter.
+            batch_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(transformer_encoder_layer, num_layers=config.retrieval_transformer_layers)
+
     def forward(self, neighbor_tokens):
         """
         neighbor_tokens: Tensor of shape (B, n_chunks, k_neighbors, neighbor_size)
+        Returns: Tensor of shape (B, n_chunks, k_neighbors, compressed_size, n_embd)
         """
         B, n_chunks, k_neighbors, neighbor_size = neighbor_tokens.size()
         bnk = B * n_chunks * k_neighbors
@@ -344,9 +362,20 @@ class NeighborEncoder(nn.Module):
         ne = ne.unsqueeze(1).expand(-1, neighbor_size, -1)
         ne = ne.repeat(B * n_chunks, 1, 1)
         
-        x = te + pe + ne
+        neighbor_embeddings = te + pe + ne
 
-        x = x.view(B, n_chunks, k_neighbors, neighbor_size, self.n_embd)
+        # Form sinks
+        sinks = self.sink_tokens.unsqueeze(0).expand(bnk, -1, -1)
+        
+        # Concat and encode
+        x = torch.cat([neighbor_embeddings, sinks], dim=1)
+
+        x = self.transformer_encoder(x)
+
+        # Slice off only the sink tokens (the compressed representation)
+        x = x[:, -self.compressed_size:, :]
+
+        x = x.view(B, n_chunks, k_neighbors, self.compressed_size, self.n_embd)
 
         return x
 
@@ -380,7 +409,7 @@ class CrossAttention(nn.Module):
     def forward(self, hidden_states, neighbor_kv):
         """
         hidden_states: Tensor of shape (B, T, C)
-        neighbor_kv: Tensor of shape (B, n_chunks, k_neighbors, neighbor_size, 2 * C)
+        neighbor_kv: Tensor of shape (B, n_chunks, k_neighbors, compressed_size, 2 * C)
         """
         B, n_chunks, k_neighbors, neighbor_size, two_C = neighbor_kv.size()
         C = two_C // 2
@@ -452,6 +481,8 @@ class GPTConfig:
     retrieval_milvus_collection_name: str = "omnikb_64_gpt2_with_continuations"
     retrieval_k_neighbors: int = 2
     retrieval_neighbor_size: int = 128
+    retrieval_compressed_size: int = 16
+    retrieval_transformer_layers: int = 2
     retrieval_neighbor_continuations: bool = True
 
 class GPT(nn.Module):
@@ -643,6 +674,8 @@ class GPT(nn.Module):
             'retrieval_milvus_collection_name',
             'retrieval_k_neighbors',
             'retrieval_neighbor_size',
+            'retrieval_compressed_size',
+            'retrieval_transformer_layers',
             'retrieval_neighbor_continuations',
         }
         assert all(k in allowed_override_args for k in override_args), f"Only {allowed_override_args} can be overridden"

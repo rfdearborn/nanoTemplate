@@ -45,6 +45,8 @@ class DatasetConfig:
     initially_skip: Optional[int] = None # can be used for resuming
     shuffle_buffer_size: int = 1000
     shuffle_seed: int = 1337
+    num_shards: Optional[int] = None
+    shard_index: Optional[int] = None
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -175,6 +177,9 @@ class StreamingDatasetsManager:
             streaming=True,
             download_config=download_config,
         ).shuffle(buffer_size=config.shuffle_buffer_size, seed=config.shuffle_seed)
+        if config.num_shards is not None:
+            assert config.shard_index is not None
+            stream=stream.shard(num_shards=config.num_shards, index=config.shard_index)
         stream.set_epoch(epoch) # in place
         if config.filter_fn:
             stream = stream.filter(config.filter_fn, with_indices=True)

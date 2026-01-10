@@ -158,6 +158,10 @@ class StreamingDatasetsManager:
             self.datasets.append(
                 self._init_dataset(dc)
             )
+        self.sample_probs = torch.tensor(
+            [d["config"].sample_weight for d in self.datasets], dtype=torch.float64
+        )
+        self.sample_probs /= self.sample_probs.sum()
     
     def _init_dataset(self, config: DatasetConfig):
         epoch = 0
@@ -203,8 +207,7 @@ class StreamingDatasetsManager:
         
         for b in range(batch_size):
             # Sample a dataset based on weights
-            sample_weights = torch.tensor([dataset["config"].sample_weight for dataset in self.datasets], device=device)
-            dataset_idx = torch.multinomial(sample_weights, 1).item()
+            dataset_idx = torch.multinomial(self.sample_probs, 1).item()
             dataset = self.datasets[dataset_idx]
             
             # Get documents until we fill this sequence

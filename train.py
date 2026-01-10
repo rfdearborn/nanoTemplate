@@ -271,12 +271,20 @@ iter_num = 0
 best_val_loss = 1e9
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, tokenizer=tokenizer, vocab_size=vocab_size, dropout=dropout) # start with model_args from command line
+model_args = dict(
+    n_layer=n_layer,
+    n_head=n_head,
+    n_embd=n_embd,
+    block_size=block_size,
+    bias=bias,
+    tokenizer=tokenizer,
+    vocab_size=vocab_size,
+    dropout=dropout,
+) # start with model_args from command line
+gptconf = GPTConfig(**model_args)
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
-    gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
@@ -284,12 +292,9 @@ elif init_from == 'resume':
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
+    # Update model_args with checkpoint's model_args
+    model_args.update(checkpoint_model_args)
     # create the model
-    gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(

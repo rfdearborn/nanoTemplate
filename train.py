@@ -21,11 +21,11 @@ from dataclasses import dataclass
 from inspect import signature
 import math
 import os
+import requests
 import time
 from typing import List, Optional
 
-from datasets import load_dataset
-import numpy as np
+from datasets import load_dataset, DownloadConfig
 import tiktoken
 import torch
 from torch.distributed import init_process_group, destroy_process_group
@@ -74,6 +74,10 @@ val_datasets = [
         filter_fn=lambda _, idx: abs(hash(str(idx))) % 100 == 0
     )
 ]
+download_config = DownloadConfig(
+    max_retries=100, # push through HF outages
+    num_proc=10, # parallelize downloads
+)
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -167,7 +171,8 @@ class StreamingDatasetsManager:
             config.dataset,
             config.subset,
             split=config.split,
-            streaming=True
+            streaming=True,
+            download_config=download_config,
         ).shuffle(buffer_size=config.shuffle_buffer_size, seed=config.shuffle_seed)
         stream.set_epoch(epoch) # in place
         if config.filter_fn:
@@ -197,30 +202,49 @@ class StreamingDatasetsManager:
             dataset = self.datasets[dataset_idx]
             
             # Get documents until we fill this sequence
-            tokens = []
-            while len(tokens) < block_size + 1:  # +1 because we need both x and y
-                try:
-                    iterator = dataset["iterator"]
-                    doc = next(iterator)
-                    # Tokenize the text using the specified field
-                    text_field = dataset["config"].text_field
-                    new_tokens = self.tokenizer.encode(doc[text_field])
-                    if len(tokens) == 0:
-                        # For first doc, start at random position
-                        start_idx = torch.randint(0, len(new_tokens), (1,)).item()
-                        new_tokens = new_tokens[start_idx:]
-                    new_tokens.append(self.tokenizer.eot_token)
-                    tokens.extend(new_tokens)
-                except StopIteration:
-                    # Refresh exhausted stream
-                    self._refresh_stream(dataset_idx)
+            sequence_tokens = []
+            while len(sequence_tokens) < block_size + 1:  # +1 because we need both x and y
+                success = False
+                retries = 0
+                max_retries = 5
+                # Try retrieving the next document with retries upon network errors
+                while not success:
+                    try:
+                        iterator = dataset["iterator"]
+                        doc = next(iterator)
+                        success = True
+                    except StopIteration:
+                        self._refresh_stream(dataset_idx)
+                    except (requests.exceptions.HTTPError,
+                            requests.exceptions.ChunkedEncodingError,
+                            requests.exceptions.ConnectionError,
+                            requests.exceptions.Timeout,
+                            requests.exceptions.RequestException) as e:
+                        retries += 1
+                        if retries > max_retries:
+                            raise e
+                        wait_time = 2 ** retries  # exponential backoff
+                        print(f"Network error encountered: {type(e).__name__}: {e}")
+                        print(f"Retrying in {wait_time} seconds (retry {retries}/{max_retries})")
+                        time.sleep(wait_time)
+                
+                config = dataset["config"]
+                # Tokenize the text using the specified field
+                text_field = config.text_field
+                new_tokens = self.tokenizer.encode(doc[text_field], **self.encode_kwargs)
+                if len(sequence_tokens) == 0:
+                    # For first doc, start at a random position
+                    start_idx = torch.randint(0, len(new_tokens), (1,)).item()
+                    new_tokens = new_tokens[start_idx:]
+                new_tokens.append(self.tokenizer.eot_token)
+                sequence_tokens.extend(new_tokens)
             
             # Trim to exact size needed
-            tokens = tokens[:block_size + 1]
+            sequence_tokens = sequence_tokens[:block_size + 1]
             
             # Populate x and y for this sequence
-            x[b] = torch.tensor(tokens[:-1], dtype=torch.long, device=device)
-            y[b] = torch.tensor(tokens[1:], dtype=torch.long, device=device)
+            x[b] = torch.tensor(sequence_tokens[:-1], dtype=torch.long, device=device)
+            y[b] = torch.tensor(sequence_tokens[1:], dtype=torch.long, device=device)
         
         return x, y
 

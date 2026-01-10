@@ -56,7 +56,6 @@ eval_interval = 100
 log_interval = 10
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = False # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # logging
 wandb_log = True
@@ -65,18 +64,8 @@ wandb_run_name = 'gpt2-124M' # 'run' + str(time.time())
 # benchmarks
 multiple_choice_benchmarks = ['HellaSwag', 'MMLU', 'Winogrande'] # DeepEval benchmark classes to run
 # data
-train_datasets = [
-    DatasetConfig(
-        dataset='openwebtext',
-        filter_fn=lambda _, idx: abs(hash(str(idx))) % 100 > 0
-    )
-]
-val_datasets = [
-    DatasetConfig(
-        dataset='openwebtext',
-        filter_fn=lambda _, idx: abs(hash(str(idx))) % 100 == 0
-    )
-]
+# we use benchmarks as val and are in an ~infinite data regime; splitting datasets doesn't add anything
+train_datasets = [DatasetConfig(dataset='openwebtext')]
 download_config = DownloadConfig(
     max_retries=100, # push through HF outages
     num_proc=10, # parallelize downloads
@@ -260,7 +249,6 @@ class StreamingDatasetsManager:
 
 datasets = {
     "train": StreamingDatasetsManager(train_datasets),
-    "val": StreamingDatasetsManager(val_datasets)
 }
 
 def get_batch(split):
@@ -268,7 +256,6 @@ def get_batch(split):
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
-best_val_loss = 1e9
 
 # model init
 model_args = dict(
@@ -305,7 +292,6 @@ elif init_from == 'resume':
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
@@ -344,7 +330,7 @@ if ddp:
 def estimate_loss():
     out = {}
     model.eval()
-    for split in ['train', 'val']:
+    for split in ['train']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
@@ -491,7 +477,7 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {iter_num}: train loss {losses['train']:.4f}")
         benchmark_scores = {}
         # only run benchmarks every 10 eval intervals
         if iter_num % (eval_interval * 10) == 0:
@@ -503,26 +489,22 @@ while True:
             wandb_dict = {
                 "iter": iter_num,
                 "train/loss": losses['train'],
-                "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             }
             for benchmark_name, score in benchmark_scores.items():
                 wandb_dict[f"benchmarks/{benchmark_name}"] = score
             wandb.log(wandb_dict)
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+        if iter_num > 0:
+            checkpoint = {
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'model_args': model_args,
+                'iter_num': iter_num,
+                'config': config,
+            }
+            print(f"saving checkpoint to {out_dir}")
+            torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
 

@@ -12,3 +12,5 @@ input.txt
 env/
 venv/
 wandb/
+scripts/.lambda_instance_id
+run_snapshots/

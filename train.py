@@ -57,7 +57,7 @@ always_save_checkpoint = False # if True, always save a checkpoint after each ev
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # logging
 wandb_log = True
-wandb_project = 'owt'
+wandb_project = 'nanoTemplate'
 wandb_run_name = 'gpt2-124M' # 'run' + str(time.time())
 # benchmarks
 multiple_choice_benchmarks = ['HellaSwag', 'MMLU', 'Winogrande'] # DeepEval benchmark classes to run

@@ -62,7 +62,7 @@ wandb_log = True
 wandb_project = 'nanoTemplate'
 wandb_run_name = 'gpt2-124M' # 'run' + str(time.time())
 # benchmarks
-multiple_choice_benchmarks = ['HellaSwag', 'MMLU', 'Winogrande'] # DeepEval benchmark classes to run
+multiple_choice_benchmarks = ['HellaSwag', 'MMLU'] # DeepEval benchmark classes to run
 # data
 # we use benchmarks as val and are in an ~infinite data regime; splitting datasets doesn't add anything
 train_datasets = [DatasetConfig(dataset='openwebtext')]

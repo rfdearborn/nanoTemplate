@@ -52,7 +52,7 @@ class DatasetConfig:
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 1000
+eval_interval = 100
 log_interval = 10
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
@@ -493,10 +493,12 @@ while True:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         benchmark_scores = {}
-        for benchmark_name in multiple_choice_benchmarks:
-            benchmark_results = run_deep_eval_benchmark(raw_model, benchmark_name)
-            print(f"{benchmark_name} results: {benchmark_results}")
-            benchmark_scores[benchmark_name] = benchmark_results['overall_score']
+        # only run benchmarks every 10 eval intervals
+        if iter_num % (eval_interval * 10) == 0:
+            for benchmark_name in multiple_choice_benchmarks:
+                benchmark_results = run_deep_eval_benchmark(raw_model, benchmark_name)
+                print(f"{benchmark_name} results: {benchmark_results}")
+                benchmark_scores[benchmark_name] = benchmark_results['overall_score']
         if wandb_log:
             wandb_dict = {
                 "iter": iter_num,

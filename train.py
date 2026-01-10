@@ -153,6 +153,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 class StreamingDatasetsManager:
     def __init__(self, dataset_configs: List[DatasetConfig]):
         self.tokenizer = tiktoken.get_encoding(tokenizer)
+        self.encode_kwargs = {"allowed_special": {"<|endoftext|>"}} # eots are in the dataset
         self.datasets = []
         for dc in dataset_configs:
             self.datasets.append(

@@ -529,6 +529,10 @@ class GPT(nn.Module):
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
         self.print_parameter_summary()
 
+        if self.retrieval_enabled:
+            # Share token embeddings with the main model
+            self.neighbor_encoder.wte = self.transformer.wte
+
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.

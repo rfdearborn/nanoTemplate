@@ -126,15 +126,15 @@ compile = True # use PyTorch 2.0 to compile the model to be faster
 use_retrieval = False  # Whether to enable RETRO mechanism
 retrieval_layers = (5, 8, 11) # Layers at which to apply retrieval (0-indexed)
 retrieval_chunk_size = 64  # Splits of input tokens for which neighbors will be retrieved
-retrieval_embedding_model = 'sentence-transformers/all-mpnet-base-v2' # Embedding model for neighbor search
+retrieval_embedding_model = 'nomic-ai/nomic-embed-text-v1.5' # Embedding model for neighbor search
 retrieval_milvus_host = "localhost" # Milvus host
 retrieval_milvus_port = "19530" # Milvus port
-retrieval_milvus_collection_name = 'omnikb_64_gpt2_with_continuations'  # Milvus collection name
+retrieval_milvus_collection_name = 'omnikb_8192_gpt2'  # Milvus collection name
 retrieval_k_neighbors = 2  # Number of neighbors to retrieve
-retrieval_neighbor_size = 128 # Maximum sequence length for neighbor encoder
+retrieval_neighbor_size = 2048 # Maximum sequence length for neighbor encoder
 retrieval_compressed_size = 16 # Final compressed length for neighbor encodings
 retrieval_transformer_layers = 2 # Number of transformer layers to use in neighbor compression
-retrieval_neighbor_continuations = True # Whether to extend retrieved neighbors with next records
+retrieval_neighbor_continuations = False # Whether to extend retrieved neighbors with next records
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file

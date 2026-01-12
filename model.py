@@ -105,7 +105,7 @@ RETRIEVER_CHUNK_ENCODERS = {}
 def get_retriever_chunk_encoder(model_name):
     global RETRIEVER_CHUNK_ENCODERS
     if model_name not in RETRIEVER_CHUNK_ENCODERS:
-        RETRIEVER_CHUNK_ENCODERS[model_name] = SentenceTransformer(model_name)
+        RETRIEVER_CHUNK_ENCODERS[model_name] = SentenceTransformer(model_name, trust_remote_code=True)
     return RETRIEVER_CHUNK_ENCODERS[model_name]
 
 PAD_TOKEN_ID = 220 # tokenizer has no pad token; 220 is " "
@@ -140,6 +140,7 @@ class NeighborRetriever(nn.Module):
 
         self._neighbor_token_cache = OrderedDict()
         self._neighbor_token_cache_max_size = 10000
+        self._lock = Lock()  # Prevent concurrent access to chunk_encoder (nomic rotary cache not thread-safe)
 
     def __del__(self):
         connections.disconnect("default")
@@ -150,131 +151,132 @@ class NeighborRetriever(nn.Module):
         idx: Tensor of shape (B, T)
         doc_ids: List of lists, length B, each containing unique source doc_ids for that sequence
         """
-        B, T = idx.size()
-        device = idx.device
-        n_chunks = T // self.chunk_size
-        assert T % self.chunk_size == 0, "Sequence length must be a multiple of chunk size"
+        with self._lock:
+            B, T = idx.size()
+            device = idx.device
+            n_chunks = T // self.chunk_size
+            assert T % self.chunk_size == 0, "Sequence length must be a multiple of chunk size"
 
-        # Reshape idx into chunks
-        idx_chunks = idx.view(B, n_chunks, self.chunk_size)
+            # Reshape idx into chunks
+            idx_chunks = idx.view(B, n_chunks, self.chunk_size)
 
-        # Flatten batch and chunk dimensions for parallel processing
-        B_n_chunks = B * n_chunks
-        idx_chunks_flat = idx_chunks.view(B_n_chunks, self.chunk_size)
+            # Flatten batch and chunk dimensions for parallel processing
+            B_n_chunks = B * n_chunks
+            idx_chunks_flat = idx_chunks.view(B_n_chunks, self.chunk_size)
 
-        # Decode chunks to text and clip to max seq length
-        idx_chunks_flat_decoded = [
-            self.tokenizer.decode(idx_chunk.tolist())
-            for idx_chunk in idx_chunks_flat
-        ]
-        # Shape: (B_n_chunks)
+            # Decode chunks to text and clip to max seq length
+            idx_chunks_flat_decoded = [
+                self.tokenizer.decode(idx_chunk.tolist())
+                for idx_chunk in idx_chunks_flat
+            ]
+            # Shape: (B_n_chunks)
 
-        # Encode chunks for retrieval using dedicated stream for parallelization
-        with torch.cuda.stream(self.embedding_stream) if self.embedding_stream else nullcontext():
-            query_embeddings_flat = self.chunk_encoder.encode(
-                idx_chunks_flat_decoded,
-                convert_to_tensor=True,
-                batch_size=512 # diminishing returns beyond
-            ).cpu().numpy()
-            # Shape: (B_n_chunks, retrieval_embedding_model_dim)
+            # Encode chunks for retrieval using dedicated stream for parallelization
+            with torch.cuda.stream(self.embedding_stream) if self.embedding_stream else nullcontext():
+                query_embeddings_flat = self.chunk_encoder.encode(
+                    idx_chunks_flat_decoded,
+                    convert_to_tensor=True,
+                    batch_size=512 # diminishing returns beyond
+                ).cpu().numpy()
+                # Shape: (B_n_chunks, retrieval_embedding_model_dim)
 
-        if self.embedding_stream:
-            self.embedding_stream.synchronize()
+            if self.embedding_stream:
+                self.embedding_stream.synchronize()
 
-        # Retrieve neighbors
-        excl_doc_ids = set().union(*doc_ids) # We trade a slight chance of false positives for native filtering
-        expr = f"doc_id not in {list(excl_doc_ids)}" if excl_doc_ids else None
-        output_fields = ["id"] if self.use_continuations else ["doc_id", "text"]
-        _results = self.collection.search(
-            data=query_embeddings_flat,
-            anns_field="vector",
-            param={"metric_type": "IP", "params": {"nprobe": 10}},
-            limit=self.k_neighbors,
-            expr=expr,
-            output_fields=output_fields
-        )
-
-        results = []
-        if self.use_continuations:
-            # Get IDs for direct neighbors and their continuations
-            expanded_ids = set()
-            for result in _results:
-                for hit in result:
-                    expanded_ids.add(hit.id)
-                    expanded_ids.add(hit.id + 1)
-            
-            # Batch fetch all 
-            _expanded_results = self.collection.query(
-                expr=f"id in {list(expanded_ids)}",
-                output_fields=["id", "doc_id", "text"]
+            # Retrieve neighbors
+            excl_doc_ids = set().union(*doc_ids) # We trade a slight chance of false positives for native filtering
+            expr = f"doc_id not in {list(excl_doc_ids)}" if excl_doc_ids else None
+            output_fields = ["id"] if self.use_continuations else ["doc_id", "text"]
+            _results = self.collection.search(
+                data=query_embeddings_flat,
+                anns_field="vector",
+                param={"metric_type": "IP", "params": {"nprobe": 10}},
+                limit=self.k_neighbors,
+                expr=expr,
+                output_fields=output_fields
             )
-            results_by_id = {str(c["id"]): c for c in _expanded_results}
-            
-            # Reconstruct results with continuations
-            for result in _results:
-                group_results = []
-                for hit in result:
-                    id = hit.id
-                    neighbor = results_by_id.get(str(id))
-                    continuation = results_by_id.get(str(id + 1))
-                    valid_continuation = continuation and continuation["doc_id"] == neighbor["doc_id"]
-                    text = neighbor["text"]
-                    if valid_continuation:
-                        text += " " + continuation["text"]
-                    group_results.append({
-                        "text": text,
-                        "doc_id": neighbor["doc_id"]
-                    })
-                results.append(group_results)
-        else:
-            for result in _results:
-                group_results = []
-                for hit in result:
-                    group_results.append({
-                        "text": hit.entity.get("text"),
-                        "doc_id": hit.entity.get("doc_id")
-                    })
-                results.append(group_results)
-            
-        # Process neighbors
-        def _process(result):
-            processed_tokens = []
-            for i in range(self.k_neighbors):
-                if i < len(result):
-                    hit = result[i]
-                    text = hit["text"]
-                    # Trim to avoid unnecessary encoding, assuming 4 chars per token plus 10% buffer
-                    # Then encode and truncate to exact token length needed
-                    trim_pos = int(4 * self.neighbor_size * 1.1)
-                    trimmed_text = text[:trim_pos]
-                    # Check cache and update using LRU strategy
-                    use_cache = self._neighbor_token_cache_max_size > 0
-                    if use_cache and trimmed_text in self._neighbor_token_cache:
-                        tokens = self._neighbor_token_cache[trimmed_text]
-                        self._neighbor_token_cache.move_to_end(trimmed_text)
+
+            results = []
+            if self.use_continuations:
+                # Get IDs for direct neighbors and their continuations
+                expanded_ids = set()
+                for result in _results:
+                    for hit in result:
+                        expanded_ids.add(hit.id)
+                        expanded_ids.add(hit.id + 1)
+
+                # Batch fetch all
+                _expanded_results = self.collection.query(
+                    expr=f"id in {list(expanded_ids)}",
+                    output_fields=["id", "doc_id", "text"]
+                )
+                results_by_id = {str(c["id"]): c for c in _expanded_results}
+
+                # Reconstruct results with continuations
+                for result in _results:
+                    group_results = []
+                    for hit in result:
+                        id = hit.id
+                        neighbor = results_by_id.get(str(id))
+                        continuation = results_by_id.get(str(id + 1))
+                        valid_continuation = continuation and continuation["doc_id"] == neighbor["doc_id"]
+                        text = neighbor["text"]
+                        if valid_continuation:
+                            text += " " + continuation["text"]
+                        group_results.append({
+                            "text": text,
+                            "doc_id": neighbor["doc_id"]
+                        })
+                    results.append(group_results)
+            else:
+                for result in _results:
+                    group_results = []
+                    for hit in result:
+                        group_results.append({
+                            "text": hit.entity.get("text"),
+                            "doc_id": hit.entity.get("doc_id")
+                        })
+                    results.append(group_results)
+
+            # Process neighbors
+            def _process(result):
+                processed_tokens = []
+                for i in range(self.k_neighbors):
+                    if i < len(result):
+                        hit = result[i]
+                        text = hit["text"]
+                        # Trim to avoid unnecessary encoding, assuming 4 chars per token plus 10% buffer
+                        # Then encode and truncate to exact token length needed
+                        trim_pos = int(4 * self.neighbor_size * 1.1)
+                        trimmed_text = text[:trim_pos]
+                        # Check cache and update using LRU strategy
+                        use_cache = self._neighbor_token_cache_max_size > 0
+                        if use_cache and trimmed_text in self._neighbor_token_cache:
+                            tokens = self._neighbor_token_cache[trimmed_text]
+                            self._neighbor_token_cache.move_to_end(trimmed_text)
+                        else:
+                            tokens = self.tokenizer.encode(trimmed_text)[:self.neighbor_size]
+                            if use_cache:
+                                self._neighbor_token_cache[trimmed_text] = tokens
+                                if len(self._neighbor_token_cache) > self._neighbor_token_cache_max_size:
+                                    self._neighbor_token_cache.popitem(last=False)
                     else:
-                        tokens = self.tokenizer.encode(trimmed_text)[:self.neighbor_size]
-                        if use_cache:
-                            self._neighbor_token_cache[trimmed_text] = tokens
-                            if len(self._neighbor_token_cache) > self._neighbor_token_cache_max_size:
-                                self._neighbor_token_cache.popitem(last=False)
-                else:
-                    # Pad with empty result if we don't have enough neighbors
-                    tokens = []
-                # Pad tokens to neighbor_size if necessary
-                padding_len = self.neighbor_size - len(tokens)
-                if padding_len > 0:
-                    tokens.extend([PAD_TOKEN_ID] * padding_len)
-                processed_tokens.append(tokens)
-            return processed_tokens
-        
-        # Note: I tried ThreadPoolExecutor but this is faster, esp with prefetching
-        neighbor_tokens = [_process(result) for result in results]
-        # Shape: (B_n_chunks, k_neighbors, neighbor_size)
-        
-        return torch.tensor(neighbor_tokens, device=device).view(
-            B, n_chunks, self.k_neighbors, self.neighbor_size
-        )
+                        # Pad with empty result if we don't have enough neighbors
+                        tokens = []
+                    # Pad tokens to neighbor_size if necessary
+                    padding_len = self.neighbor_size - len(tokens)
+                    if padding_len > 0:
+                        tokens.extend([PAD_TOKEN_ID] * padding_len)
+                    processed_tokens.append(tokens)
+                return processed_tokens
+
+            # Note: I tried ThreadPoolExecutor but this is faster, esp with prefetching
+            neighbor_tokens = [_process(result) for result in results]
+            # Shape: (B_n_chunks, k_neighbors, neighbor_size)
+
+            return torch.tensor(neighbor_tokens, device=device).view(
+                B, n_chunks, self.k_neighbors, self.neighbor_size
+            )
 
 class AsyncRetrieverManager:
     def __init__(self, config):
@@ -475,15 +477,15 @@ class GPTConfig:
     use_retrieval: bool = False
     retrieval_layers: list = (5, 8, 11)
     retrieval_chunk_size: int = 64
-    retrieval_embedding_model: str = 'sentence-transformers/all-mpnet-base-v2'
+    retrieval_embedding_model: str = 'nomic-ai/nomic-embed-text-v1.5'
     retrieval_milvus_host: str = "localhost"
     retrieval_milvus_port: str = "19530"
-    retrieval_milvus_collection_name: str = "omnikb_64_gpt2_with_continuations"
+    retrieval_milvus_collection_name: str = "omnikb_8192_gpt2"
     retrieval_k_neighbors: int = 2
-    retrieval_neighbor_size: int = 128
+    retrieval_neighbor_size: int = 2048
     retrieval_compressed_size: int = 16
     retrieval_transformer_layers: int = 2
-    retrieval_neighbor_continuations: bool = True
+    retrieval_neighbor_continuations: bool = False
 
 class GPT(nn.Module):
 
